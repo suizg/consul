@@ -47,6 +47,8 @@ github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 h1:DDGfHa7BWjL4Yn
 github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869/go.mod h1:Ekp36dRnpXw/yCqJaO+ZrUyxD+3VXMFFr56k5XYrpB4=
 github.com/boltdb/bolt v1.3.1 h1:JQmyP4ZBrce+ZQu0dY660FMfatumYDLun9hBCUVIkF4=
 github.com/boltdb/bolt v1.3.1/go.mod h1:clJnj/oiGkjum5o1McbSZDSLxVThjynRyGBgiAx27Ps=
+github.com/briankassouf/jose v0.9.2-0.20180619214549-d2569464773f h1:ZMEzE7R0WNqgbHplzSBaYJhJi5AZWTCK9baU0ebzG6g=
+github.com/briankassouf/jose v0.9.2-0.20180619214549-d2569464773f/go.mod h1:HQhVmdUf7dBNwIIdBTivnCDxcf6IZY3/zrb+uKSJz6Y=
 github.com/cenkalti/backoff v2.1.1+incompatible h1:tKJnvO2kl0zmb/jA5UKAt4VoEVw1qxKWjE/Bpp46npY=
 github.com/cenkalti/backoff v2.1.1+incompatible/go.mod h1:90ReRw6GdpyfrHakVjL/QHaoyV4aDUVVkXQJJJ3NXXM=
 github.com/circonus-labs/circonus-gometrics v0.0.0-20161109192337-d17a8420c36e h1:VhMcRhkS/wJM+XfZxNn+tk5EVmF2k19g6yS6uDXHn0o=

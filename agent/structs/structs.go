@@ -33,30 +33,34 @@ type RaftIndex struct {
 // These are serialized between Consul servers and stored in Consul snapshots,
 // so entries must only ever be added.
 const (
-	RegisterRequestType        MessageType = 0
-	DeregisterRequestType                  = 1
-	KVSRequestType                         = 2
-	SessionRequestType                     = 3
-	ACLRequestType                         = 4 // DEPRECATED (ACL-Legacy-Compat)
-	TombstoneRequestType                   = 5
-	CoordinateBatchUpdateType              = 6
-	PreparedQueryRequestType               = 7
-	TxnRequestType                         = 8
-	AutopilotRequestType                   = 9
-	AreaRequestType                        = 10
-	ACLBootstrapRequestType                = 11
-	IntentionRequestType                   = 12
-	ConnectCARequestType                   = 13
-	ConnectCAProviderStateType             = 14
-	ConnectCAConfigType                    = 15 // FSM snapshots only.
-	IndexRequestType                       = 16 // FSM snapshots only.
-	ACLTokenSetRequestType                 = 17
-	ACLTokenDeleteRequestType              = 18
-	ACLPolicySetRequestType                = 19
-	ACLPolicyDeleteRequestType             = 20
-	ConnectCALeafRequestType               = 21
-	ACLRoleSetRequestType                  = 22
-	ACLRoleDeleteRequestType               = 23
+	RegisterRequestType                  MessageType = 0
+	DeregisterRequestType                            = 1
+	KVSRequestType                                   = 2
+	SessionRequestType                               = 3
+	ACLRequestType                                   = 4 // DEPRECATED (ACL-Legacy-Compat)
+	TombstoneRequestType                             = 5
+	CoordinateBatchUpdateType                        = 6
+	PreparedQueryRequestType                         = 7
+	TxnRequestType                                   = 8
+	AutopilotRequestType                             = 9
+	AreaRequestType                                  = 10
+	ACLBootstrapRequestType                          = 11
+	IntentionRequestType                             = 12
+	ConnectCARequestType                             = 13
+	ConnectCAProviderStateType                       = 14
+	ConnectCAConfigType                              = 15 // FSM snapshots only.
+	IndexRequestType                                 = 16 // FSM snapshots only.
+	ACLTokenSetRequestType                           = 17
+	ACLTokenDeleteRequestType                        = 18
+	ACLPolicySetRequestType                          = 19
+	ACLPolicyDeleteRequestType                       = 20
+	ConnectCALeafRequestType                         = 21
+	ACLRoleSetRequestType                            = 22
+	ACLRoleDeleteRequestType                         = 23
+	ACLRoleBindingRuleSetRequestType                 = 24
+	ACLRoleBindingRuleDeleteRequestType              = 25
+	ACLIdentityProviderSetRequestType                = 26
+	ACLIdentityProviderDeleteRequestType             = 27
 )
 
 const (

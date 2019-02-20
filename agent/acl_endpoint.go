@@ -375,6 +375,7 @@ func (s *HTTPServer) ACLTokenList(resp http.ResponseWriter, req *http.Request) (
 
 	args.Policy = req.URL.Query().Get("policy")
 	args.Role = req.URL.Query().Get("role")
+	args.IDPName = req.URL.Query().Get("idp")
 
 	var out structs.ACLTokenListResponse
 	defer setMeta(resp, &out.QueryMeta)
@@ -694,6 +695,314 @@ func (s *HTTPServer) ACLRoleDelete(resp http.ResponseWriter, req *http.Request, 
 
 	var ignored string
 	if err := s.agent.RPC("ACL.RoleDelete", args, &ignored); err != nil {
+		return nil, err
+	}
+
+	return true, nil
+}
+
+func (s *HTTPServer) ACLRoleBindingRuleList(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	var args structs.ACLRoleBindingRuleListRequest
+	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
+		return nil, nil
+	}
+
+	if args.Datacenter == "" {
+		args.Datacenter = s.agent.config.Datacenter
+	}
+
+	var out structs.ACLRoleBindingRuleListResponse
+	defer setMeta(resp, &out.QueryMeta)
+	if err := s.agent.RPC("ACL.RoleBindingRuleList", &args, &out); err != nil {
+		return nil, err
+	}
+
+	// make sure we return an array and not nil
+	if out.RoleBindingRules == nil {
+		out.RoleBindingRules = make(structs.ACLRoleBindingRules, 0)
+	}
+
+	return out.RoleBindingRules, nil
+}
+
+func (s *HTTPServer) ACLRoleBindingRuleCRUD(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	var fn func(resp http.ResponseWriter, req *http.Request, roleBindingRuleID string) (interface{}, error)
+
+	switch req.Method {
+	case "GET":
+		fn = s.ACLRoleBindingRuleRead
+
+	case "PUT":
+		fn = s.ACLRoleBindingRuleWrite
+
+	case "DELETE":
+		fn = s.ACLRoleBindingRuleDelete
+
+	default:
+		return nil, MethodNotAllowedError{req.Method, []string{"GET", "PUT", "DELETE"}}
+	}
+
+	roleBindingRuleID := strings.TrimPrefix(req.URL.Path, "/v1/acl/rolebindingrule/")
+	if roleBindingRuleID == "" && req.Method != "PUT" {
+		return nil, BadRequestError{Reason: "Missing role binding rule ID"}
+	}
+
+	return fn(resp, req, roleBindingRuleID)
+}
+
+func (s *HTTPServer) ACLRoleBindingRuleRead(resp http.ResponseWriter, req *http.Request, roleBindingRuleID string) (interface{}, error) {
+	args := structs.ACLRoleBindingRuleGetRequest{
+		Datacenter:        s.agent.config.Datacenter,
+		RoleBindingRuleID: roleBindingRuleID,
+	}
+	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
+		return nil, nil
+	}
+
+	if args.Datacenter == "" {
+		args.Datacenter = s.agent.config.Datacenter
+	}
+
+	var out structs.ACLRoleBindingRuleResponse
+	defer setMeta(resp, &out.QueryMeta)
+	if err := s.agent.RPC("ACL.RoleBindingRuleRead", &args, &out); err != nil {
+		return nil, err
+	}
+
+	if out.RoleBindingRule == nil {
+		return nil, acl.ErrNotFound
+	}
+
+	return out.RoleBindingRule, nil
+}
+
+func (s *HTTPServer) ACLRoleBindingRuleCreate(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	return s.ACLRoleBindingRuleWrite(resp, req, "")
+}
+
+func (s *HTTPServer) ACLRoleBindingRuleWrite(resp http.ResponseWriter, req *http.Request, roleBindingRuleID string) (interface{}, error) {
+	args := structs.ACLRoleBindingRuleSetRequest{
+		Datacenter: s.agent.config.Datacenter,
+	}
+	s.parseToken(req, &args.Token)
+
+	if err := decodeBody(req, &args.RoleBindingRule, fixTimeAndHashFields); err != nil {
+		return nil, BadRequestError{Reason: fmt.Sprintf("RoleBindingRule decoding failed: %v", err)}
+	}
+
+	if args.RoleBindingRule.ID != "" && args.RoleBindingRule.ID != roleBindingRuleID {
+		return nil, BadRequestError{Reason: "RoleBindingRule ID in URL and payload do not match"}
+	} else if args.RoleBindingRule.ID == "" {
+		args.RoleBindingRule.ID = roleBindingRuleID
+	}
+
+	var out structs.ACLRoleBindingRule
+	if err := s.agent.RPC("ACL.RoleBindingRuleSet", args, &out); err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func (s *HTTPServer) ACLRoleBindingRuleDelete(resp http.ResponseWriter, req *http.Request, roleBindingRuleID string) (interface{}, error) {
+	args := structs.ACLRoleBindingRuleDeleteRequest{
+		Datacenter:        s.agent.config.Datacenter,
+		RoleBindingRuleID: roleBindingRuleID,
+	}
+	s.parseToken(req, &args.Token)
+
+	var out string
+	if err := s.agent.RPC("ACL.RoleBindingRuleDelete", args, &out); err != nil {
+		return nil, err
+	}
+
+	return true, nil
+}
+
+func (s *HTTPServer) ACLIdentityProviderList(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	var args structs.ACLIdentityProviderListRequest
+	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
+		return nil, nil
+	}
+
+	if args.Datacenter == "" {
+		args.Datacenter = s.agent.config.Datacenter
+	}
+
+	var out structs.ACLIdentityProviderListResponse
+	defer setMeta(resp, &out.QueryMeta)
+	if err := s.agent.RPC("ACL.IdentityProviderList", &args, &out); err != nil {
+		return nil, err
+	}
+
+	// make sure we return an array and not nil
+	if out.IdentityProviders == nil {
+		out.IdentityProviders = make(structs.ACLIdentityProviderListStubs, 0)
+	}
+
+	return out.IdentityProviders, nil
+}
+
+func (s *HTTPServer) ACLIdentityProviderCRUD(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	var fn func(resp http.ResponseWriter, req *http.Request, idpName string) (interface{}, error)
+
+	switch req.Method {
+	case "GET":
+		fn = s.ACLIdentityProviderRead
+
+	case "PUT":
+		fn = s.ACLIdentityProviderWrite
+
+	case "DELETE":
+		fn = s.ACLIdentityProviderDelete
+
+	default:
+		return nil, MethodNotAllowedError{req.Method, []string{"GET", "PUT", "DELETE"}}
+	}
+
+	idpName := strings.TrimPrefix(req.URL.Path, "/v1/acl/idp/")
+	if idpName == "" && req.Method != "PUT" {
+		return nil, BadRequestError{Reason: "Missing identity provider name"}
+	}
+
+	return fn(resp, req, idpName)
+}
+
+func (s *HTTPServer) ACLIdentityProviderRead(resp http.ResponseWriter, req *http.Request, idpName string) (interface{}, error) {
+	args := structs.ACLIdentityProviderGetRequest{
+		Datacenter:           s.agent.config.Datacenter,
+		IdentityProviderName: idpName,
+	}
+	if done := s.parse(resp, req, &args.Datacenter, &args.QueryOptions); done {
+		return nil, nil
+	}
+
+	if args.Datacenter == "" {
+		args.Datacenter = s.agent.config.Datacenter
+	}
+
+	var out structs.ACLIdentityProviderResponse
+	defer setMeta(resp, &out.QueryMeta)
+	if err := s.agent.RPC("ACL.IdentityProviderRead", &args, &out); err != nil {
+		return nil, err
+	}
+
+	if out.IdentityProvider == nil {
+		return nil, acl.ErrNotFound
+	}
+
+	return out.IdentityProvider, nil
+}
+
+func (s *HTTPServer) ACLIdentityProviderCreate(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	return s.ACLIdentityProviderWrite(resp, req, "")
+}
+
+func (s *HTTPServer) ACLIdentityProviderWrite(resp http.ResponseWriter, req *http.Request, idpName string) (interface{}, error) {
+	args := structs.ACLIdentityProviderSetRequest{
+		Datacenter: s.agent.config.Datacenter,
+	}
+	s.parseToken(req, &args.Token)
+
+	if err := decodeBody(req, &args.IdentityProvider, fixTimeAndHashFields); err != nil {
+		return nil, BadRequestError{Reason: fmt.Sprintf("IdentityProvider decoding failed: %v", err)}
+	}
+
+	// TODO: should we introduce ids again?
+	if idpName != "" {
+		if args.IdentityProvider.Name != "" && args.IdentityProvider.Name != idpName {
+			return nil, BadRequestError{Reason: "IdentityProvider Name in URL and payload do not match"}
+		} else if args.IdentityProvider.Name == "" {
+			args.IdentityProvider.Name = idpName
+		}
+	}
+
+	var out structs.ACLIdentityProvider
+	if err := s.agent.RPC("ACL.IdentityProviderSet", args, &out); err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func (s *HTTPServer) ACLIdentityProviderDelete(resp http.ResponseWriter, req *http.Request, idpName string) (interface{}, error) {
+	args := structs.ACLIdentityProviderDeleteRequest{
+		Datacenter:           s.agent.config.Datacenter,
+		IdentityProviderName: idpName,
+	}
+	s.parseToken(req, &args.Token)
+
+	var out string
+	if err := s.agent.RPC("ACL.IdentityProviderDelete", args, &out); err != nil {
+		return nil, err
+	}
+
+	return true, nil
+}
+
+func (s *HTTPServer) ACLLogin(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	args := &structs.ACLLoginRequest{
+		Datacenter: s.agent.config.Datacenter,
+	}
+	s.parseDC(req, &args.Datacenter)
+
+	if err := decodeBody(req, &args.Auth, nil); err != nil {
+		return nil, BadRequestError{Reason: fmt.Sprintf("Failed to decode request body:: %v", err)}
+	}
+
+	var out structs.ACLToken
+	if err := s.agent.RPC("ACL.Login", args, &out); err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func (s *HTTPServer) ACLLogout(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	if s.checkACLDisabled(resp, req) {
+		return nil, nil
+	}
+
+	args := structs.ACLLogoutRequest{
+		Datacenter: s.agent.config.Datacenter,
+	}
+	s.parseDC(req, &args.Datacenter)
+	s.parseToken(req, &args.Token)
+
+	if args.Token == "" {
+		return nil, acl.ErrNotFound
+	}
+
+	var ignored bool
+	if err := s.agent.RPC("ACL.Logout", &args, &ignored); err != nil {
 		return nil, err
 	}
 

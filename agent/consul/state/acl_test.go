@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"math/rand"
 	"strconv"
 	"testing"
@@ -51,6 +52,17 @@ func testACLStateStore(t *testing.T) *Store {
 	setupGlobalManagement(t, s)
 	setupAnonymous(t, s)
 	return s
+}
+
+func setupExtraIDPs(t *testing.T, s *Store) {
+	idps := structs.ACLIdentityProviders{
+		&structs.ACLIdentityProvider{
+			Name:        "k8s",
+			Type:        "kubernetes",
+			Description: "test",
+		},
+	}
+	require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
 }
 
 func setupExtraPolicies(t *testing.T, s *Store) {
@@ -205,7 +217,7 @@ func TestStateStore_ACLBootstrap(t *testing.T) {
 	require.Equal(t, uint64(3), index)
 
 	// Make sure the ACLs are in an expected state.
-	_, tokens, err := s.ACLTokenList(nil, true, true, "", "")
+	_, tokens, err := s.ACLTokenList(nil, true, true, "", "", "")
 	require.NoError(t, err)
 	require.Len(t, tokens, 1)
 	compareTokens(t, token1, tokens[0])
@@ -219,7 +231,7 @@ func TestStateStore_ACLBootstrap(t *testing.T) {
 	err = s.ACLBootstrap(32, index, token2.Clone(), false)
 	require.NoError(t, err)
 
-	_, tokens, err = s.ACLTokenList(nil, true, true, "", "")
+	_, tokens, err = s.ACLTokenList(nil, true, true, "", "", "")
 	require.NoError(t, err)
 	require.Len(t, tokens, 2)
 }
@@ -447,6 +459,19 @@ func TestStateStore_ACLToken_SetGet(t *testing.T) {
 		require.Error(t, err)
 	})
 
+	t.Run("Unresolvable IDPName", func(t *testing.T) {
+		t.Parallel()
+		s := testACLTokensStateStore(t)
+		token := &structs.ACLToken{
+			AccessorID: "daf37c07-d04d-4fd5-9678-a8206a57d61a",
+			SecretID:   "39171632-6f34-4411-827f-9416403687f4",
+			IDPName:    "k8s",
+		}
+
+		err := s.ACLTokenSet(2, token, false)
+		require.Error(t, err)
+	})
+
 	t.Run("New", func(t *testing.T) {
 		t.Parallel()
 		s := testACLTokensStateStore(t)
@@ -542,6 +567,37 @@ func TestStateStore_ACLToken_SetGet(t *testing.T) {
 		require.Equal(t, "node-read-role", rtoken.Roles[0].Name)
 		require.Len(t, rtoken.ServiceIdentities, 1)
 		require.Equal(t, "db", rtoken.ServiceIdentities[0].ServiceName)
+	})
+
+	t.Run("New with IDP", func(t *testing.T) {
+		t.Parallel()
+		s := testACLTokensStateStore(t)
+		setupExtraIDPs(t, s)
+
+		token := &structs.ACLToken{
+			AccessorID: "daf37c07-d04d-4fd5-9678-a8206a57d61a",
+			SecretID:   "39171632-6f34-4411-827f-9416403687f4",
+			IDPName:    "k8s",
+			Roles: []structs.ACLTokenRoleLink{
+				structs.ACLTokenRoleLink{
+					ID: testRoleID_A,
+				},
+			},
+		}
+
+		require.NoError(t, s.ACLTokenSet(2, token.Clone(), false))
+
+		idx, rtoken, err := s.ACLTokenGetByAccessor(nil, "daf37c07-d04d-4fd5-9678-a8206a57d61a")
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), idx)
+		compareTokens(t, token, rtoken)
+		require.Equal(t, uint64(2), rtoken.CreateIndex)
+		require.Equal(t, uint64(2), rtoken.ModifyIndex)
+		require.Equal(t, "k8s", rtoken.IDPName)
+		require.Len(t, rtoken.Policies, 0)
+		require.Len(t, rtoken.ServiceIdentities, 0)
+		require.Len(t, rtoken.Roles, 1)
+		require.Equal(t, "node-read-role", rtoken.Roles[0].Name)
 	})
 }
 
@@ -828,6 +884,7 @@ func TestStateStore_ACLTokens_ListUpgradeable(t *testing.T) {
 func TestStateStore_ACLToken_List(t *testing.T) {
 	t.Parallel()
 	s := testACLTokensStateStore(t)
+	setupExtraIDPs(t, s)
 
 	tokens := structs.ACLTokens{
 		// the local token
@@ -893,6 +950,19 @@ func TestStateStore_ACLToken_List(t *testing.T) {
 			},
 			Local: true,
 		},
+		// the idp specific token
+		&structs.ACLToken{
+			AccessorID: "74277ae1-6a9b-4035-b444-2370fe6a2cb5",
+			SecretID:   "ab8ac834-0d35-4cb7-83c3-168203f986cd",
+			IDPName:    "k8s",
+		},
+		// the idp specific token and local
+		&structs.ACLToken{
+			AccessorID: "211f0360-ef53-41d3-9d4d-db84396eb6c0",
+			SecretID:   "087a0eb4-366f-4190-ab4c-a4aa3d2562aa",
+			IDPName:    "k8s",
+			Local:      true,
+		},
 	}
 
 	require.NoError(t, s.ACLTokenBatchSet(2, tokens, false))
@@ -903,108 +973,144 @@ func TestStateStore_ACLToken_List(t *testing.T) {
 		global    bool
 		policy    string
 		role      string
+		idpName   string
 		accessors []string
 	}
 
 	cases := []testCase{
 		{
-			name:   "Global",
-			local:  false,
-			global: true,
-			policy: "",
-			role:   "",
+			name:    "Global",
+			local:   false,
+			global:  true,
+			policy:  "",
+			role:    "",
+			idpName: "",
 			accessors: []string{
 				structs.ACLTokenAnonymousID,
 				"47eea4da-bda1-48a6-901c-3e36d2d9262f", // policy + global
 				"54866514-3cf2-4fec-8a8a-710583831834", // mgmt + global
+				"74277ae1-6a9b-4035-b444-2370fe6a2cb5", // idp + global
 				"a7715fde-8954-4c92-afbc-d84c6ecdc582", // role + global
 			},
 		},
 		{
-			name:   "Local",
-			local:  true,
-			global: false,
-			policy: "",
-			role:   "",
+			name:    "Local",
+			local:   true,
+			global:  false,
+			policy:  "",
+			role:    "",
+			idpName: "",
 			accessors: []string{
+				"211f0360-ef53-41d3-9d4d-db84396eb6c0", // idp + local
 				"4915fc9d-3726-4171-b588-6c271f45eecd", // policy + local
 				"cadb4f13-f62a-49ab-ab3f-5a7e01b925d9", // role + local
 				"f1093997-b6c7-496d-bfb8-6b1b1895641b", // mgmt + local
 			},
 		},
 		{
-			name:   "Policy",
-			local:  true,
-			global: true,
-			policy: testPolicyID_A,
-			role:   "",
+			name:    "Policy",
+			local:   true,
+			global:  true,
+			policy:  testPolicyID_A,
+			role:    "",
+			idpName: "",
 			accessors: []string{
 				"47eea4da-bda1-48a6-901c-3e36d2d9262f", // policy + global
 				"4915fc9d-3726-4171-b588-6c271f45eecd", // policy + local
 			},
 		},
 		{
-			name:   "Policy - Local",
-			local:  true,
-			global: false,
-			policy: testPolicyID_A,
-			role:   "",
+			name:    "Policy - Local",
+			local:   true,
+			global:  false,
+			policy:  testPolicyID_A,
+			role:    "",
+			idpName: "",
 			accessors: []string{
 				"4915fc9d-3726-4171-b588-6c271f45eecd", // policy + local
 			},
 		},
 		{
-			name:   "Policy - Global",
-			local:  false,
-			global: true,
-			policy: testPolicyID_A,
-			role:   "",
+			name:    "Policy - Global",
+			local:   false,
+			global:  true,
+			policy:  testPolicyID_A,
+			role:    "",
+			idpName: "",
 			accessors: []string{
 				"47eea4da-bda1-48a6-901c-3e36d2d9262f", // policy + global
 			},
 		},
 		{
-			name:   "Role",
-			local:  true,
-			global: true,
-			policy: "",
-			role:   testRoleID_A,
+			name:    "Role",
+			local:   true,
+			global:  true,
+			policy:  "",
+			role:    testRoleID_A,
+			idpName: "",
 			accessors: []string{
 				"a7715fde-8954-4c92-afbc-d84c6ecdc582", // role + global
 				"cadb4f13-f62a-49ab-ab3f-5a7e01b925d9", // role + local
 			},
 		},
 		{
-			name:   "Role - Local",
-			local:  true,
-			global: false,
-			policy: "",
-			role:   testRoleID_A,
+			name:    "Role - Local",
+			local:   true,
+			global:  false,
+			policy:  "",
+			role:    testRoleID_A,
+			idpName: "",
 			accessors: []string{
 				"cadb4f13-f62a-49ab-ab3f-5a7e01b925d9", // role + local
 			},
 		},
 		{
-			name:   "Role - Global",
-			local:  false,
-			global: true,
-			policy: "",
-			role:   testRoleID_A,
+			name:    "Role - Global",
+			local:   false,
+			global:  true,
+			policy:  "",
+			role:    testRoleID_A,
+			idpName: "",
 			accessors: []string{
 				"a7715fde-8954-4c92-afbc-d84c6ecdc582", // role + global
 			},
 		},
 		{
-			name:   "All",
-			local:  true,
-			global: true,
-			policy: "",
-			role:   "",
+			name:    "IDP - Local",
+			local:   true,
+			global:  false,
+			policy:  "",
+			role:    "",
+			idpName: "k8s",
+			accessors: []string{
+				"211f0360-ef53-41d3-9d4d-db84396eb6c0", // idp + local
+			},
+		},
+		{
+			name:    "IDP - Global",
+			local:   false,
+			global:  true,
+			policy:  "",
+			role:    "",
+			idpName: "k8s",
+			accessors: []string{
+				"74277ae1-6a9b-4035-b444-2370fe6a2cb5", // idp + global
+			},
+		},
+		{
+			name:    "All",
+			local:   true,
+			global:  true,
+			policy:  "",
+			role:    "",
+			idpName: "",
 			accessors: []string{
 				structs.ACLTokenAnonymousID,
+				"211f0360-ef53-41d3-9d4d-db84396eb6c0", // idp + local
 				"47eea4da-bda1-48a6-901c-3e36d2d9262f", // policy + global
 				"4915fc9d-3726-4171-b588-6c271f45eecd", // policy + local
 				"54866514-3cf2-4fec-8a8a-710583831834", // mgmt + global
+				"74277ae1-6a9b-4035-b444-2370fe6a2cb5", // idp + global
 				"a7715fde-8954-4c92-afbc-d84c6ecdc582", // role + global
 				"cadb4f13-f62a-49ab-ab3f-5a7e01b925d9", // role + local
 				"f1093997-b6c7-496d-bfb8-6b1b1895641b", // mgmt + local
@@ -1012,16 +1118,23 @@ func TestStateStore_ACLToken_List(t *testing.T) {
 		},
 	}
 
-	t.Run("can't filter on both", func(t *testing.T) {
-		_, _, err := s.ACLTokenList(nil, false, false, testPolicyID_A, testRoleID_A)
-		require.Error(t, err)
-	})
+	for _, tc := range []struct{ policy, role, idpName string }{
+		{testPolicyID_A, testRoleID_A, "k8s"},
+		{"", testRoleID_A, "k8s"},
+		{testPolicyID_A, "", "k8s"},
+		{testPolicyID_A, testRoleID_A, ""},
+	} {
+		t.Run(fmt.Sprintf("can't filter on more than one: %s/%s/%s", tc.policy, tc.role, tc.idpName), func(t *testing.T) {
+			_, _, err := s.ACLTokenList(nil, false, false, tc.policy, tc.role, tc.idpName)
+			require.Error(t, err)
+		})
+	}
 
 	for _, tc := range cases {
 		tc := tc // capture range variable
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, tokens, err := s.ACLTokenList(nil, tc.local, tc.global, tc.policy, tc.role)
+			_, tokens, err := s.ACLTokenList(nil, tc.local, tc.global, tc.policy, tc.role, tc.idpName)
 			require.NoError(t, err)
 			require.Len(t, tokens, len(tc.accessors))
 			tokens.Sort()
@@ -1082,7 +1195,7 @@ func TestStateStore_ACLToken_FixupPolicyLinks(t *testing.T) {
 	require.Equal(t, "node-read-renamed", retrieved.Policies[0].Name)
 
 	// list tokens without stale links
-	_, tokens, err := s.ACLTokenList(nil, true, true, "", "")
+	_, tokens, err := s.ACLTokenList(nil, true, true, "", "", "")
 	require.NoError(t, err)
 
 	found := false
@@ -1126,7 +1239,7 @@ func TestStateStore_ACLToken_FixupPolicyLinks(t *testing.T) {
 	require.Len(t, retrieved.Policies, 0)
 
 	// list tokens without stale links
-	_, tokens, err = s.ACLTokenList(nil, true, true, "", "")
+	_, tokens, err = s.ACLTokenList(nil, true, true, "", "", "")
 	require.NoError(t, err)
 
 	found = false
@@ -1211,7 +1324,7 @@ func TestStateStore_ACLToken_FixupRoleLinks(t *testing.T) {
 	require.Equal(t, "node-read-role-renamed", retrieved.Roles[0].Name)
 
 	// list tokens without stale links
-	_, tokens, err := s.ACLTokenList(nil, true, true, "", "")
+	_, tokens, err := s.ACLTokenList(nil, true, true, "", "", "")
 	require.NoError(t, err)
 
 	found := false
@@ -1255,7 +1368,7 @@ func TestStateStore_ACLToken_FixupRoleLinks(t *testing.T) {
 	require.Len(t, retrieved.Roles, 0)
 
 	// list tokens without stale links
-	_, tokens, err = s.ACLTokenList(nil, true, true, "", "")
+	_, tokens, err = s.ACLTokenList(nil, true, true, "", "", "")
 	require.NoError(t, err)
 
 	found = false
@@ -2074,7 +2187,7 @@ func TestStateStore_ACLRoles_UpsertBatchRead(t *testing.T) {
 
 		require.NoError(t, s.ACLRoleBatchSet(2, roles))
 
-		idx, rroles, err := s.ACLRoleBatchGet(nil, []string{testRoleID_A, testRoleID_B})
+		idx, rroles, err := s.ACLRoleBatchGet(nil, []string{testRoleID_A, testRoleID_B}, nil)
 		require.NoError(t, err)
 		require.Equal(t, uint64(2), idx)
 		require.Len(t, rroles, 2)
@@ -2144,7 +2257,7 @@ func TestStateStore_ACLRoles_UpsertBatchRead(t *testing.T) {
 
 		require.NoError(t, s.ACLRoleBatchSet(3, updates))
 
-		idx, rroles, err := s.ACLRoleBatchGet(nil, []string{testRoleID_A, testRoleID_B})
+		idx, rroles, err := s.ACLRoleBatchGet(nil, []string{testRoleID_A, testRoleID_B}, nil)
 
 		require.NoError(t, err)
 		require.Equal(t, uint64(3), idx)
@@ -2328,7 +2441,7 @@ func TestStateStore_ACLRole_FixupPolicyLinks(t *testing.T) {
 	require.True(t, found)
 
 	// batch get without stale links
-	_, roles, err = s.ACLRoleBatchGet(nil, []string{role.ID})
+	_, roles, err = s.ACLRoleBatchGet(nil, []string{role.ID}, nil)
 	require.NoError(t, err)
 
 	found = false
@@ -2371,7 +2484,7 @@ func TestStateStore_ACLRole_FixupPolicyLinks(t *testing.T) {
 	require.True(t, found)
 
 	// batch get without stale links
-	_, roles, err = s.ACLRoleBatchGet(nil, []string{role.ID})
+	_, roles, err = s.ACLRoleBatchGet(nil, []string{role.ID}, nil)
 	require.NoError(t, err)
 
 	found = false
@@ -2501,6 +2614,675 @@ func TestStateStore_ACLRole_Delete(t *testing.T) {
 		// deletion of non-existant roles is not an error
 		require.NoError(t, s.ACLRoleDeleteByName(3, "not-found"))
 		require.NoError(t, s.ACLRoleDeleteByID(3, testRoleID_A))
+	})
+}
+
+func TestStateStore_ACLIdentityProvider_SetGet(t *testing.T) {
+	t.Parallel()
+
+	// The state store only validates key pieces of data, so we only have to
+	// care about filling in Name+Type.
+
+	t.Run("Missing Name", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		idp := structs.ACLIdentityProvider{
+			Name:        "",
+			Type:        "kubernetes",
+			Description: "test",
+		}
+
+		require.Error(t, s.ACLIdentityProviderSet(3, &idp))
+	})
+
+	t.Run("Missing Type", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		idp := structs.ACLIdentityProvider{
+			Name:        "k8s",
+			Type:        "",
+			Description: "test",
+		}
+
+		require.Error(t, s.ACLIdentityProviderSet(3, &idp))
+	})
+
+	t.Run("New", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		idp := structs.ACLIdentityProvider{
+			Name:        "k8s",
+			Type:        "kubernetes",
+			Description: "test",
+		}
+
+		require.NoError(t, s.ACLIdentityProviderSet(3, &idp))
+
+		idx, ridp, err := s.ACLIdentityProviderGetByName(nil, "k8s")
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), idx)
+		require.NotNil(t, ridp)
+		require.Equal(t, "k8s", ridp.Name)
+		require.Equal(t, "kubernetes", ridp.Type)
+		require.Equal(t, "test", ridp.Description)
+		require.Equal(t, uint64(3), ridp.CreateIndex)
+		require.Equal(t, uint64(3), ridp.ModifyIndex)
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		// Create the initial idp
+		idp := structs.ACLIdentityProvider{
+			Name:        "k8s",
+			Type:        "kubernetes",
+			Description: "test",
+		}
+
+		require.NoError(t, s.ACLIdentityProviderSet(2, &idp))
+
+		// Now make sure we can update it
+		update := structs.ACLIdentityProvider{
+			Name:           "k8s",
+			Type:           "kubernetes",
+			Description:    "modified",
+			KubernetesHost: "https://localhost:8443",
+		}
+
+		require.NoError(t, s.ACLIdentityProviderSet(3, &update))
+
+		idx, ridp, err := s.ACLIdentityProviderGetByName(nil, "k8s")
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), idx)
+		require.NotNil(t, ridp)
+		require.Equal(t, "k8s", ridp.Name)
+		require.Equal(t, "kubernetes", ridp.Type)
+		require.Equal(t, "modified", ridp.Description)
+		require.Equal(t, "https://localhost:8443", ridp.KubernetesHost)
+		require.Equal(t, uint64(2), ridp.CreateIndex)
+		require.Equal(t, uint64(3), ridp.ModifyIndex)
+	})
+}
+
+func TestStateStore_ACLIdentityProviders_UpsertBatchRead(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Normal", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		idps := structs.ACLIdentityProviders{
+			&structs.ACLIdentityProvider{
+				Name:        "k8s-1",
+				Type:        "kubernetes",
+				Description: "test-1",
+			},
+			&structs.ACLIdentityProvider{
+				Name:        "k8s-2",
+				Type:        "kubernetes",
+				Description: "test-1",
+			},
+		}
+
+		require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
+
+		idx, ridps, err := s.ACLIdentityProviderBatchGet(nil, []string{"k8s-1", "k8s-2"})
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), idx)
+		require.Len(t, ridps, 2)
+		ridps.Sort()
+		require.ElementsMatch(t, idps, ridps)
+		require.Equal(t, uint64(2), ridps[0].CreateIndex)
+		require.Equal(t, uint64(2), ridps[0].ModifyIndex)
+		require.Equal(t, uint64(2), ridps[1].CreateIndex)
+		require.Equal(t, uint64(2), ridps[1].ModifyIndex)
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		// Seed initial data.
+		idps := structs.ACLIdentityProviders{
+			&structs.ACLIdentityProvider{
+				Name:        "k8s-1",
+				Type:        "kubernetes",
+				Description: "test-1",
+			},
+			&structs.ACLIdentityProvider{
+				Name:        "k8s-2",
+				Type:        "kubernetes",
+				Description: "test-2",
+			},
+		}
+
+		require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
+
+		// Update two idps at the same time.
+		updates := structs.ACLIdentityProviders{
+			&structs.ACLIdentityProvider{
+				Name:           "k8s-1",
+				Type:           "kubernetes",
+				Description:    "test-1 modified",
+				KubernetesHost: "https://localhost:8443",
+			},
+			&structs.ACLIdentityProvider{
+				Name:           "k8s-2",
+				Type:           "kubernetes",
+				Description:    "test-2 modified",
+				KubernetesHost: "https://localhost:8444",
+			},
+		}
+
+		require.NoError(t, s.ACLIdentityProviderBatchSet(3, updates))
+
+		idx, ridps, err := s.ACLIdentityProviderBatchGet(nil, []string{"k8s-1", "k8s-2"})
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), idx)
+		require.Len(t, ridps, 2)
+		ridps.Sort()
+		require.ElementsMatch(t, updates, ridps)
+		require.Equal(t, uint64(2), ridps[0].CreateIndex)
+		require.Equal(t, uint64(3), ridps[0].ModifyIndex)
+		require.Equal(t, uint64(2), ridps[1].CreateIndex)
+		require.Equal(t, uint64(3), ridps[1].ModifyIndex)
+	})
+}
+
+func TestStateStore_ACLIdentityProvider_List(t *testing.T) {
+	t.Parallel()
+	s := testACLStateStore(t)
+
+	idps := structs.ACLIdentityProviders{
+		&structs.ACLIdentityProvider{
+			Name:        "k8s-1",
+			Type:        "kubernetes",
+			Description: "test-1",
+		},
+		&structs.ACLIdentityProvider{
+			Name:        "k8s-2",
+			Type:        "kubernetes",
+			Description: "test-2",
+		},
+	}
+
+	require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
+
+	_, ridps, err := s.ACLIdentityProviderList(nil)
+	require.NoError(t, err)
+
+	require.Len(t, ridps, 2)
+	ridps.Sort()
+
+	require.Equal(t, "k8s-1", ridps[0].Name)
+	require.Equal(t, "kubernetes", ridps[0].Type)
+	require.Equal(t, "test-1", ridps[0].Description)
+	require.Equal(t, uint64(2), ridps[0].CreateIndex)
+	require.Equal(t, uint64(2), ridps[0].ModifyIndex)
+
+	require.Equal(t, "k8s-2", ridps[1].Name)
+	require.Equal(t, "kubernetes", ridps[1].Type)
+	require.Equal(t, "test-2", ridps[1].Description)
+	require.Equal(t, uint64(2), ridps[1].CreateIndex)
+	require.Equal(t, uint64(2), ridps[1].ModifyIndex)
+}
+
+func TestStateStore_ACLIdentityProvider_Delete(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Name", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		idp := structs.ACLIdentityProvider{
+			Name:        "k8s",
+			Type:        "kubernetes",
+			Description: "test",
+		}
+
+		require.NoError(t, s.ACLIdentityProviderSet(2, &idp))
+
+		_, ridp, err := s.ACLIdentityProviderGetByName(nil, "k8s")
+		require.NoError(t, err)
+		require.NotNil(t, ridp)
+
+		require.NoError(t, s.ACLIdentityProviderDeleteByName(3, "k8s"))
+		require.NoError(t, err)
+
+		_, ridp, err = s.ACLIdentityProviderGetByName(nil, "k8s")
+		require.NoError(t, err)
+		require.Nil(t, ridp)
+	})
+
+	t.Run("Multiple", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		idps := structs.ACLIdentityProviders{
+			&structs.ACLIdentityProvider{
+				Name:        "k8s-1",
+				Type:        "kubernetes",
+				Description: "test-1",
+			},
+			&structs.ACLIdentityProvider{
+				Name:        "k8s-2",
+				Type:        "kubernetes",
+				Description: "test-2",
+			},
+		}
+
+		require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
+
+		_, ridp, err := s.ACLIdentityProviderGetByName(nil, "k8s-1")
+		require.NoError(t, err)
+		require.NotNil(t, ridp)
+		_, ridp, err = s.ACLIdentityProviderGetByName(nil, "k8s-2")
+		require.NoError(t, err)
+		require.NotNil(t, ridp)
+
+		require.NoError(t, s.ACLIdentityProviderBatchDelete(3, []string{"k8s-1", "k8s-2"}))
+
+		_, ridp, err = s.ACLIdentityProviderGetByName(nil, "k8s-1")
+		require.NoError(t, err)
+		require.Nil(t, ridp)
+		_, ridp, err = s.ACLIdentityProviderGetByName(nil, "k8s-2")
+		require.NoError(t, err)
+		require.Nil(t, ridp)
+	})
+
+	t.Run("Not Found", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		// deletion of non-existant idps is not an error
+		require.NoError(t, s.ACLIdentityProviderDeleteByName(3, "not-found"))
+	})
+}
+
+// Deleting an identity provider atomically deletes all rules as well.
+func TestStateStore_ACLIdentityProvider_Delete_RuleCascade(t *testing.T) {
+	t.Parallel()
+
+	s := testACLStateStore(t)
+
+	idps := structs.ACLIdentityProviders{
+		&structs.ACLIdentityProvider{
+			Name:        "k8s-1",
+			Type:        "kubernetes",
+			Description: "test-1",
+		},
+		&structs.ACLIdentityProvider{
+			Name:        "k8s-2",
+			Type:        "kubernetes",
+			Description: "test-2",
+		},
+	}
+	require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
+
+	const (
+		idp1_rule1 = "dff6f8a3-0115-4b22-8661-04a497ebb23c"
+		idp1_rule2 = "69e2d304-703d-4889-bd94-4a720c061fc3"
+		idp2_rule1 = "997ee45c-d6ba-4da1-a98e-aaa012e7d1e2"
+		idp2_rule2 = "9ebae132-f1f1-4b72-b1d9-a4313ac22075"
+	)
+
+	rules := structs.ACLRoleBindingRules{
+		&structs.ACLRoleBindingRule{
+			ID:          idp1_rule1,
+			IDPName:     "k8s-1",
+			Description: "test-i1-r1",
+		},
+		&structs.ACLRoleBindingRule{
+			ID:          idp1_rule2,
+			IDPName:     "k8s-1",
+			Description: "test-i1-r2",
+		},
+		&structs.ACLRoleBindingRule{
+			ID:          idp2_rule1,
+			IDPName:     "k8s-2",
+			Description: "test-i2-r1",
+		},
+		&structs.ACLRoleBindingRule{
+			ID:          idp2_rule2,
+			IDPName:     "k8s-2",
+			Description: "test-i2-r2",
+		},
+	}
+	require.NoError(t, s.ACLRoleBindingRuleBatchSet(3, rules))
+
+	// Delete one idp.
+	require.NoError(t, s.ACLIdentityProviderDeleteByName(4, "k8s-1"))
+
+	// Make sure the idp is gone.
+	_, ridp, err := s.ACLIdentityProviderGetByName(nil, "k8s-1")
+	require.NoError(t, err)
+	require.Nil(t, ridp)
+
+	// Make sure the rules are gone.
+	for _, ruleID := range []string{idp1_rule1, idp1_rule2} {
+		_, rrule, err := s.ACLRoleBindingRuleGetByID(nil, ruleID)
+		require.NoError(t, err)
+		require.Nil(t, rrule)
+	}
+
+	// Make sure the rules for the untouched IDP are still there.
+	for _, ruleID := range []string{idp2_rule1, idp2_rule2} {
+		_, rrule, err := s.ACLRoleBindingRuleGetByID(nil, ruleID)
+		require.NoError(t, err)
+		require.NotNil(t, rrule)
+	}
+}
+
+func TestStateStore_ACLRoleBindingRule_SetGet(t *testing.T) {
+	t.Parallel()
+
+	// The state store only validates key pieces of data, so we only have to
+	// care about filling in ID+IDPName.
+
+	t.Run("Missing ID", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rule := structs.ACLRoleBindingRule{
+			ID:          "",
+			IDPName:     "k8s",
+			Description: "test",
+		}
+
+		require.Error(t, s.ACLRoleBindingRuleSet(3, &rule))
+	})
+
+	t.Run("Missing IDPName", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rule := structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "",
+			Description: "test",
+		}
+
+		require.Error(t, s.ACLRoleBindingRuleSet(3, &rule))
+	})
+
+	t.Run("Unknown IDPName", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rule := structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "unknown",
+			Description: "test",
+		}
+
+		require.Error(t, s.ACLRoleBindingRuleSet(3, &rule))
+	})
+
+	t.Run("New", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rule := structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "k8s",
+			Description: "test",
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleSet(3, &rule))
+
+		idx, rrule, err := s.ACLRoleBindingRuleGetByID(nil, rule.ID)
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), idx)
+		require.NotNil(t, rrule)
+		require.Equal(t, rule.ID, rrule.ID)
+		require.Equal(t, "k8s", rrule.IDPName)
+		require.Equal(t, "test", rrule.Description)
+		require.Equal(t, uint64(3), rrule.CreateIndex)
+		require.Equal(t, uint64(3), rrule.ModifyIndex)
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		// Create the initial rule
+		rule := structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "k8s",
+			Description: "test",
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleSet(2, &rule))
+
+		// Now make sure we can update it
+		update := structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "k8s",
+			Description: "modified",
+			RoleName:    "web",
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleSet(3, &update))
+
+		idx, rrule, err := s.ACLRoleBindingRuleGetByID(nil, rule.ID)
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), idx)
+		require.NotNil(t, rrule)
+		require.Equal(t, rule.ID, rrule.ID)
+		require.Equal(t, "k8s", rrule.IDPName)
+		require.Equal(t, "modified", rrule.Description)
+		require.Equal(t, "web", rrule.RoleName)
+		require.Equal(t, uint64(2), rrule.CreateIndex)
+		require.Equal(t, uint64(3), rrule.ModifyIndex)
+	})
+}
+
+func TestStateStore_ACLRoleBindingRules_UpsertBatchRead(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Normal", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rules := structs.ACLRoleBindingRules{
+			&structs.ACLRoleBindingRule{
+				ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+				IDPName:     "k8s",
+				Description: "test-1",
+			},
+			&structs.ACLRoleBindingRule{
+				ID:          "3ebcc27b-f8ba-4611-b385-79a065dfb983",
+				IDPName:     "k8s",
+				Description: "test-2",
+			},
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleBatchSet(2, rules))
+
+		idx, rrules, err := s.ACLRoleBindingRuleBatchGet(nil, []string{rules[0].ID, rules[1].ID})
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), idx)
+		require.Len(t, rrules, 2)
+		rrules.Sort()
+		require.ElementsMatch(t, rules, rrules)
+		require.Equal(t, uint64(2), rrules[0].CreateIndex)
+		require.Equal(t, uint64(2), rrules[0].ModifyIndex)
+		require.Equal(t, uint64(2), rrules[1].CreateIndex)
+		require.Equal(t, uint64(2), rrules[1].ModifyIndex)
+	})
+
+	t.Run("Update", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		// Seed initial data.
+		rules := structs.ACLRoleBindingRules{
+			&structs.ACLRoleBindingRule{
+				ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+				IDPName:     "k8s",
+				Description: "test-1",
+			},
+			&structs.ACLRoleBindingRule{
+				ID:          "3ebcc27b-f8ba-4611-b385-79a065dfb983",
+				IDPName:     "k8s",
+				Description: "test-2",
+			},
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleBatchSet(2, rules))
+
+		// Update two rules at the same time.
+		updates := structs.ACLRoleBindingRules{
+			&structs.ACLRoleBindingRule{
+				ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+				IDPName:     "k8s",
+				Description: "test-1 modified",
+				RoleName:    "web-1",
+			},
+			&structs.ACLRoleBindingRule{
+				ID:          "3ebcc27b-f8ba-4611-b385-79a065dfb983",
+				IDPName:     "k8s",
+				Description: "test-2 modified",
+				RoleName:    "web-2",
+			},
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleBatchSet(3, updates))
+
+		idx, rrules, err := s.ACLRoleBindingRuleBatchGet(nil, []string{rules[0].ID, rules[1].ID})
+		require.NoError(t, err)
+		require.Equal(t, uint64(3), idx)
+		require.Len(t, rrules, 2)
+		rrules.Sort()
+		require.ElementsMatch(t, updates, rrules)
+		require.Equal(t, uint64(2), rrules[0].CreateIndex)
+		require.Equal(t, uint64(3), rrules[0].ModifyIndex)
+		require.Equal(t, uint64(2), rrules[1].CreateIndex)
+		require.Equal(t, uint64(3), rrules[1].ModifyIndex)
+	})
+}
+
+func TestStateStore_ACLRoleBindingRule_List(t *testing.T) {
+	t.Parallel()
+	s := testACLStateStore(t)
+	setupExtraIDPs(t, s)
+
+	rules := structs.ACLRoleBindingRules{
+		&structs.ACLRoleBindingRule{
+			ID:          "3ebcc27b-f8ba-4611-b385-79a065dfb983",
+			IDPName:     "k8s",
+			Description: "test-1",
+		},
+		&structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "k8s",
+			Description: "test-2",
+		},
+	}
+
+	require.NoError(t, s.ACLRoleBindingRuleBatchSet(2, rules))
+
+	_, rrules, err := s.ACLRoleBindingRuleList(nil, "")
+	require.NoError(t, err)
+
+	require.Len(t, rrules, 2)
+	rrules.Sort()
+
+	require.Equal(t, "3ebcc27b-f8ba-4611-b385-79a065dfb983", rrules[0].ID)
+	require.Equal(t, "k8s", rrules[0].IDPName)
+	require.Equal(t, "test-1", rrules[0].Description)
+	require.Equal(t, uint64(2), rrules[0].CreateIndex)
+	require.Equal(t, uint64(2), rrules[0].ModifyIndex)
+
+	require.Equal(t, "9669b2d7-455c-4d70-b0ac-457fd7969a2e", rrules[1].ID)
+	require.Equal(t, "k8s", rrules[1].IDPName)
+	require.Equal(t, "test-2", rrules[1].Description)
+	require.Equal(t, uint64(2), rrules[1].CreateIndex)
+	require.Equal(t, uint64(2), rrules[1].ModifyIndex)
+}
+
+func TestStateStore_ACLRoleBindingRule_Delete(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Name", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rule := structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "k8s",
+			Description: "test",
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleSet(2, &rule))
+
+		_, rrule, err := s.ACLRoleBindingRuleGetByID(nil, rule.ID)
+		require.NoError(t, err)
+		require.NotNil(t, rrule)
+
+		require.NoError(t, s.ACLRoleBindingRuleDeleteByID(3, rule.ID))
+		require.NoError(t, err)
+
+		_, rrule, err = s.ACLRoleBindingRuleGetByID(nil, rule.ID)
+		require.NoError(t, err)
+		require.Nil(t, rrule)
+	})
+
+	t.Run("Multiple", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+		setupExtraIDPs(t, s)
+
+		rules := structs.ACLRoleBindingRules{
+			&structs.ACLRoleBindingRule{
+				ID:          "3ebcc27b-f8ba-4611-b385-79a065dfb983",
+				IDPName:     "k8s",
+				Description: "test-1",
+			},
+			&structs.ACLRoleBindingRule{
+				ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+				IDPName:     "k8s",
+				Description: "test-2",
+			},
+		}
+
+		require.NoError(t, s.ACLRoleBindingRuleBatchSet(2, rules))
+
+		_, rrule, err := s.ACLRoleBindingRuleGetByID(nil, rules[0].ID)
+		require.NoError(t, err)
+		require.NotNil(t, rrule)
+		_, rrule, err = s.ACLRoleBindingRuleGetByID(nil, rules[1].ID)
+		require.NoError(t, err)
+		require.NotNil(t, rrule)
+
+		require.NoError(t, s.ACLRoleBindingRuleBatchDelete(3, []string{rules[0].ID, rules[1].ID}))
+
+		_, rrule, err = s.ACLRoleBindingRuleGetByID(nil, rules[0].ID)
+		require.NoError(t, err)
+		require.Nil(t, rrule)
+		_, rrule, err = s.ACLRoleBindingRuleGetByID(nil, rules[1].ID)
+		require.NoError(t, err)
+		require.Nil(t, rrule)
+	})
+
+	t.Run("Not Found", func(t *testing.T) {
+		t.Parallel()
+		s := testACLStateStore(t)
+
+		// deletion of non-existant rules is not an error
+		require.NoError(t, s.ACLRoleBindingRuleDeleteByID(3, "ed3ce1b8-3a16-4e2f-b82e-f92e3b92410d"))
 	})
 }
 
@@ -2651,7 +3433,7 @@ func TestStateStore_ACLTokens_Snapshot_Restore(t *testing.T) {
 		require.NoError(t, s.ACLRoleBatchSet(2, roles))
 
 		// Read the restored ACLs back out and verify that they match.
-		idx, res, err := s.ACLTokenList(nil, true, true, "", "")
+		idx, res, err := s.ACLTokenList(nil, true, true, "", "", "")
 		require.NoError(t, err)
 		require.Equal(t, uint64(4), idx)
 		require.ElementsMatch(t, tokens, res)
@@ -2989,5 +3771,122 @@ func TestStateStore_ACLRoles_Snapshot_Restore(t *testing.T) {
 		require.Equal(t, uint64(2), idx)
 		require.ElementsMatch(t, roles, res)
 		require.Equal(t, uint64(2), s.maxIndex("acl-roles"))
+	}()
+}
+
+func TestStateStore_ACLIdentityProviders_Snapshot_Restore(t *testing.T) {
+	s := testACLStateStore(t)
+
+	idps := structs.ACLIdentityProviders{
+		&structs.ACLIdentityProvider{
+			Name:        "k8s-1",
+			Type:        "kubernetes",
+			Description: "test-1",
+			RaftIndex:   structs.RaftIndex{CreateIndex: 1, ModifyIndex: 2},
+		},
+		&structs.ACLIdentityProvider{
+			Name:        "k8s-2",
+			Type:        "kubernetes",
+			Description: "test-2",
+			RaftIndex:   structs.RaftIndex{CreateIndex: 1, ModifyIndex: 2},
+		},
+	}
+
+	require.NoError(t, s.ACLIdentityProviderBatchSet(2, idps))
+
+	// Snapshot the ACLs.
+	snap := s.Snapshot()
+	defer snap.Close()
+
+	// Alter the real state store.
+	require.NoError(t, s.ACLIdentityProviderDeleteByName(3, "k8s-1"))
+
+	// Verify the snapshot.
+	require.Equal(t, uint64(2), snap.LastIndex())
+
+	iter, err := snap.ACLIdentityProviders()
+	require.NoError(t, err)
+
+	var dump structs.ACLIdentityProviders
+	for idp := iter.Next(); idp != nil; idp = iter.Next() {
+		dump = append(dump, idp.(*structs.ACLIdentityProvider))
+	}
+	require.ElementsMatch(t, dump, idps)
+
+	// Restore the values into a new state store.
+	func() {
+		s := testStateStore(t)
+		restore := s.Restore()
+		for _, idp := range dump {
+			require.NoError(t, restore.ACLIdentityProvider(idp))
+		}
+		restore.Commit()
+
+		// Read the restored idps back out and verify that they match.
+		idx, res, err := s.ACLIdentityProviderList(nil)
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), idx)
+		require.ElementsMatch(t, idps, res)
+		require.Equal(t, uint64(2), s.maxIndex("acl-identity-providers"))
+	}()
+}
+
+func TestStateStore_ACLRoleBindingRules_Snapshot_Restore(t *testing.T) {
+	s := testACLStateStore(t)
+	setupExtraIDPs(t, s)
+
+	rules := structs.ACLRoleBindingRules{
+		&structs.ACLRoleBindingRule{
+			ID:          "9669b2d7-455c-4d70-b0ac-457fd7969a2e",
+			IDPName:     "k8s",
+			Description: "test-1",
+			RaftIndex:   structs.RaftIndex{CreateIndex: 1, ModifyIndex: 2},
+		},
+		&structs.ACLRoleBindingRule{
+			ID:          "3ebcc27b-f8ba-4611-b385-79a065dfb983",
+			IDPName:     "k8s",
+			Description: "test-2",
+			RaftIndex:   structs.RaftIndex{CreateIndex: 1, ModifyIndex: 2},
+		},
+	}
+
+	require.NoError(t, s.ACLRoleBindingRuleBatchSet(2, rules))
+
+	// Snapshot the ACLs.
+	snap := s.Snapshot()
+	defer snap.Close()
+
+	// Alter the real state store.
+	require.NoError(t, s.ACLRoleBindingRuleDeleteByID(3, rules[0].ID))
+
+	// Verify the snapshot.
+	require.Equal(t, uint64(2), snap.LastIndex())
+
+	iter, err := snap.ACLRoleBindingRules()
+	require.NoError(t, err)
+
+	var dump structs.ACLRoleBindingRules
+	for rule := iter.Next(); rule != nil; rule = iter.Next() {
+		dump = append(dump, rule.(*structs.ACLRoleBindingRule))
+	}
+	require.ElementsMatch(t, dump, rules)
+
+	// Restore the values into a new state store.
+	func() {
+		s := testStateStore(t)
+		setupExtraIDPs(t, s)
+
+		restore := s.Restore()
+		for _, rule := range dump {
+			require.NoError(t, restore.ACLRoleBindingRule(rule))
+		}
+		restore.Commit()
+
+		// Read the restored rules back out and verify that they match.
+		idx, res, err := s.ACLRoleBindingRuleList(nil, "")
+		require.NoError(t, err)
+		require.Equal(t, uint64(2), idx)
+		require.ElementsMatch(t, rules, res)
+		require.Equal(t, uint64(2), s.maxIndex("acl-role-binding-rules"))
 	}()
 }

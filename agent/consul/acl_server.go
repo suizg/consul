@@ -73,6 +73,17 @@ func (s *Server) checkRoleUUID(id string) (bool, error) {
 	return !structs.ACLIDReserved(id), nil
 }
 
+func (s *Server) checkRoleBindingRuleUUID(id string) (bool, error) {
+	state := s.fsm.State()
+	if _, rule, err := state.ACLRoleBindingRuleGetByID(nil, id); err != nil {
+		return false, err
+	} else if rule != nil {
+		return false, nil
+	}
+
+	return !structs.ACLIDReserved(id), nil
+}
+
 func (s *Server) updateACLAdvertisement() {
 	// One thing to note is that once in new ACL mode the server will
 	// never transition to legacy ACL mode. This is not currently a
@@ -186,6 +197,20 @@ func (s *Server) ResolvePolicyFromID(policyID string) (bool, *structs.ACLPolicy,
 
 func (s *Server) ResolveRoleFromID(roleID string) (bool, *structs.ACLRole, error) {
 	index, role, err := s.fsm.State().ACLRoleGetByID(nil, roleID)
+	if err != nil {
+		return true, nil, err
+	} else if role != nil {
+		return true, role, nil
+	}
+
+	// If the max index of the roles table is non-zero then we have acls, until then
+	// we may need to allow remote resolution. This is particularly useful to allow updating
+	// the replication token via the API in a non-primary dc.
+	return s.InACLDatacenter() || index > 0, role, acl.ErrNotFound
+}
+
+func (s *Server) ResolveRoleFromName(roleName string) (bool, *structs.ACLRole, error) {
+	index, role, err := s.fsm.State().ACLRoleGetByName(nil, roleName)
 	if err != nil {
 		return true, nil, err
 	} else if role != nil {

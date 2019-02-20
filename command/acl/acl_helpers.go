@@ -29,7 +29,11 @@ func PrintToken(token *api.ACLToken, ui cli.Ui, showMeta bool) {
 	}
 	ui.Info(fmt.Sprintf("Roles:"))
 	for _, role := range token.Roles {
-		ui.Info(fmt.Sprintf("   %s - %s", role.ID, role.Name))
+		if role.BoundName == "" {
+			ui.Info(fmt.Sprintf("   %s - %s", role.ID, role.Name))
+		} else {
+			ui.Info(fmt.Sprintf("   %s", role.BoundName))
+		}
 	}
 	ui.Info(fmt.Sprintf("Service Identities:"))
 	for _, svcid := range token.ServiceIdentities {
@@ -65,7 +69,11 @@ func PrintTokenListEntry(token *api.ACLTokenListEntry, ui cli.Ui, showMeta bool)
 	}
 	ui.Info(fmt.Sprintf("Roles:"))
 	for _, role := range token.Roles {
-		ui.Info(fmt.Sprintf("   %s - %s", role.ID, role.Name))
+		if role.BoundName == "" {
+			ui.Info(fmt.Sprintf("   %s - %s", role.ID, role.Name))
+		} else {
+			ui.Info(fmt.Sprintf("   %s", role.BoundName))
+		}
 	}
 	ui.Info(fmt.Sprintf("Service Identities:"))
 	for _, svcid := range token.ServiceIdentities {

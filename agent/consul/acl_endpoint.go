@@ -1,6 +1,8 @@
 package consul
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -30,11 +32,16 @@ var (
 	serviceIdentityNameMaxLength = 256
 	validRoleName                = regexp.MustCompile(`^[a-z0-9]([a-z0-9\-_]*[a-z0-9])?$`)
 	roleNameMaxLength            = 256
+	validIDPName                 = regexp.MustCompile(`^[a-z0-9]([a-z0-9\-_]*[a-z0-9])?$`)
+	idpNameMaxLength             = 256
 )
 
 // ACL endpoint is used to manipulate ACLs
 type ACL struct {
 	srv *Server
+
+	// disableLoginOnlyRestrictionOnTokenSet is only to be used in tests
+	disableLoginOnlyRestrictionOnTokenSet bool
 }
 
 // fileBootstrapResetIndex retrieves the reset index specified by the administrator from
@@ -274,6 +281,10 @@ func (a *ACL) TokenClone(args *structs.ACLTokenSetRequest, reply *structs.ACLTok
 		return a.srv.forwardDC("ACL.TokenClone", a.srv.config.ACLDatacenter, args, reply)
 	}
 
+	if token.IDPName != "" {
+		return fmt.Errorf("Cannot clone a token created from an identity provider")
+	}
+
 	if token.Rules != "" {
 		return fmt.Errorf("Cannot clone a legacy ACL with this endpoint")
 	}
@@ -322,10 +333,10 @@ func (a *ACL) TokenSet(args *structs.ACLTokenSetRequest, reply *structs.ACLToken
 		return acl.ErrPermissionDenied
 	}
 
-	return a.tokenSetInternal(args, reply, false)
+	return a.tokenSetInternal(args, reply, a.disableLoginOnlyRestrictionOnTokenSet)
 }
 
-func (a *ACL) tokenSetInternal(args *structs.ACLTokenSetRequest, reply *structs.ACLToken, upgrade bool) error {
+func (a *ACL) tokenSetInternal(args *structs.ACLTokenSetRequest, reply *structs.ACLToken, fromLogin bool) error {
 	token := &args.ACLToken
 
 	if !a.srv.LocalTokensEnabled() {
@@ -354,6 +365,16 @@ func (a *ACL) tokenSetInternal(args *structs.ACLTokenSetRequest, reply *structs.
 		}
 
 		token.CreateTime = time.Now()
+
+		if fromLogin {
+			if token.IDPName == "" {
+				return fmt.Errorf("IDPName field is required during Login")
+			}
+		} else {
+			if token.IDPName != "" {
+				return fmt.Errorf("IDPName field is disallowed outside of Login")
+			}
+		}
 
 		// Ensure an ExpirationTTL is valid if provided.
 		if token.ExpirationTTL != 0 {
@@ -419,15 +440,15 @@ func (a *ACL) tokenSetInternal(args *structs.ACLTokenSetRequest, reply *structs.
 			return fmt.Errorf("cannot toggle local mode of %s", token.AccessorID)
 		}
 
+		if token.IDPName != existing.IDPName {
+			return fmt.Errorf("Cannot change IDPName of %s", token.AccessorID)
+		}
+
 		if token.ExpirationTTL != 0 || !token.ExpirationTime.Equal(existing.ExpirationTime) {
 			return fmt.Errorf("Cannot change expiration time of %s", token.AccessorID)
 		}
 
-		if upgrade {
-			token.CreateTime = time.Now()
-		} else {
-			token.CreateTime = existing.CreateTime
-		}
+		token.CreateTime = existing.CreateTime
 	}
 
 	policyIDs := make(map[string]struct{})
@@ -457,29 +478,49 @@ func (a *ACL) tokenSetInternal(args *structs.ACLTokenSetRequest, reply *structs.
 	}
 	token.Policies = policies
 
-	roleIDs := make(map[string]struct{})
-	var roles []structs.ACLTokenRoleLink
+	var (
+		roleIDs        = make(map[string]struct{})
+		roleBoundNames = make(map[string]struct{})
+		roles          []structs.ACLTokenRoleLink
+	)
 
-	// Validate all the role names and convert them to role IDs
+	// Validate all the role names and convert them to role IDs except the ones
+	// that originate from role binding rules.
 	for _, link := range token.Roles {
-		if link.ID == "" {
-			_, role, err := state.ACLRoleGetByName(nil, link.Name)
-			if err != nil {
-				return fmt.Errorf("Error looking up role for name %q: %v", link.Name, err)
+		if link.BoundName != "" {
+			if !fromLogin {
+				return fmt.Errorf("Cannot link a role to a token using a bound name outside of login")
 			}
-			if role == nil {
-				return fmt.Errorf("No such ACL role with name %q", link.Name)
+			if link.ID != "" || link.Name != "" {
+				return fmt.Errorf("Role links can either set BoundName OR ID/Name but not both")
 			}
-			link.ID = role.ID
-		}
 
-		// Do not store the role name within raft/memdb as the role could be renamed in the future.
-		link.Name = ""
+			// dedup role links by bound name (note we do not dedupe BoundName
+			// and Name fields within the same request)
+			if _, ok := roleBoundNames[link.BoundName]; !ok {
+				roles = append(roles, link)
+				roleBoundNames[link.BoundName] = struct{}{}
+			}
+		} else {
+			if link.ID == "" {
+				_, role, err := state.ACLRoleGetByName(nil, link.Name)
+				if err != nil {
+					return fmt.Errorf("Error looking up role for name %q: %v", link.Name, err)
+				}
+				if role == nil {
+					return fmt.Errorf("No such ACL role with name %q", link.Name)
+				}
+				link.ID = role.ID
+			}
 
-		// dedup role links by id
-		if _, ok := roleIDs[link.ID]; !ok {
-			roles = append(roles, link)
-			roleIDs[link.ID] = struct{}{}
+			// Do not store the role name within raft/memdb as the role could be renamed in the future.
+			link.Name = ""
+
+			// dedup role links by id
+			if _, ok := roleIDs[link.ID]; !ok {
+				roles = append(roles, link)
+				roleIDs[link.ID] = struct{}{}
+			}
 		}
 	}
 	token.Roles = roles
@@ -645,7 +686,7 @@ func (a *ACL) TokenList(args *structs.ACLTokenListRequest, reply *structs.ACLTok
 
 	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
-			index, tokens, err := state.ACLTokenList(ws, args.IncludeLocal, args.IncludeGlobal, args.Policy, args.Role)
+			index, tokens, err := state.ACLTokenList(ws, args.IncludeLocal, args.IncludeGlobal, args.Policy, args.Role, args.IDPName)
 			if err != nil {
 				return err
 			}
@@ -964,6 +1005,8 @@ func (a *ACL) PolicyList(args *structs.ACLPolicyListRequest, reply *structs.ACLP
 
 // PolicyResolve is used to retrieve a subset of the policies associated with a given token
 // The policy ids in the args simply act as a filter on the policy set assigned to the token
+//
+// This does not return synthetic policies.
 func (a *ACL) PolicyResolve(args *structs.ACLPolicyBatchGetRequest, reply *structs.ACLPolicyBatchResponse) error {
 	if err := a.aclPreCheck(); err != nil {
 		return err
@@ -974,7 +1017,7 @@ func (a *ACL) PolicyResolve(args *structs.ACLPolicyBatchGetRequest, reply *struc
 	}
 
 	// get full list of policies for this token
-	identity, policies, err := a.srv.acls.resolveTokenToIdentityAndPolicies(args.Token)
+	identity, policies, err := a.srv.acls.resolveTokenToIdentityAndPolicies(args.Token, false)
 	if err != nil {
 		return err
 	}
@@ -1071,6 +1114,15 @@ func (a *ACL) ReplicationStatus(args *structs.DCSpecificRequest,
 	return nil
 }
 
+// isValidIDPName returns true if the provided name can be used as an
+// ACLIdentityProvider name.
+func isValidIDPName(name string) bool {
+	if len(name) < 1 || len(name) > idpNameMaxLength {
+		return false
+	}
+	return validIDPName.MatchString(name)
+}
+
 // isValidRoleName returns true if the provided name can be used as an ACLRole
 // name.
 func isValidRoleName(name string) bool {
@@ -1134,7 +1186,7 @@ func (a *ACL) RoleBatchRead(args *structs.ACLRoleBatchGetRequest, reply *structs
 
 	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
 		func(ws memdb.WatchSet, state *state.Store) error {
-			index, roles, err := state.ACLRoleBatchGet(ws, args.RoleIDs)
+			index, roles, err := state.ACLRoleBatchGet(ws, args.RoleIDs, args.RoleNames)
 			if err != nil {
 				return err
 			}
@@ -1182,6 +1234,7 @@ func (a *ACL) RoleSet(args *structs.ACLRoleSetRequest, reply *structs.ACLRole) e
 		return fmt.Errorf("Invalid Role: invalid Name. Only alphanumeric characters, '-' and '_' are allowed")
 	}
 
+	var formerName string
 	if role.ID == "" {
 		// with no role ID one will be generated
 		var err error
@@ -1216,6 +1269,7 @@ func (a *ACL) RoleSet(args *structs.ACLRoleSetRequest, reply *structs.ACLRole) e
 			} else if nameMatch != nil {
 				return fmt.Errorf("Invalid Role: A role with name %q already exists", role.Name)
 			}
+			formerName = existing.Name
 		}
 	}
 
@@ -1275,7 +1329,10 @@ func (a *ACL) RoleSet(args *structs.ACLRoleSetRequest, reply *structs.ACLRole) e
 	}
 
 	// Remove from the cache to prevent stale cache usage
-	a.srv.acls.cache.RemoveRole(role.ID)
+	a.srv.acls.cache.RemoveRole(role.ID, role.Name)
+	if formerName != "" {
+		a.srv.acls.cache.RemoveRole("", formerName)
+	}
 
 	if respErr, ok := resp.(error); ok {
 		return respErr
@@ -1328,7 +1385,7 @@ func (a *ACL) RoleDelete(args *structs.ACLRoleDeleteRequest, reply *string) erro
 		return fmt.Errorf("Failed to apply role delete request: %v", err)
 	}
 
-	a.srv.acls.cache.RemoveRole(role.ID)
+	a.srv.acls.cache.RemoveRole(role.ID, role.Name)
 
 	if respErr, ok := resp.(error); ok {
 		return respErr
@@ -1375,6 +1432,8 @@ func (a *ACL) RoleList(args *structs.ACLRoleListRequest, reply *structs.ACLRoleL
 
 // RoleResolve is used to retrieve a subset of the roles associated with a given token
 // The role ids in the args simply act as a filter on the role set assigned to the token
+//
+// This does not return synthetic roles.
 func (a *ACL) RoleResolve(args *structs.ACLRoleBatchGetRequest, reply *structs.ACLRoleBatchResponse) error {
 	if err := a.aclPreCheck(); err != nil {
 		return err
@@ -1385,17 +1444,23 @@ func (a *ACL) RoleResolve(args *structs.ACLRoleBatchGetRequest, reply *structs.A
 	}
 
 	// get full list of roles for this token
-	identity, roles, err := a.srv.acls.resolveTokenToIdentityAndRoles(args.Token)
+	identity, roles, err := a.srv.acls.resolveTokenToIdentityAndRoles(args.Token, false)
 	if err != nil {
 		return err
 	}
 
 	idMap := make(map[string]*structs.ACLRole)
+	nameMap := make(map[string]*structs.ACLRole)
 	for _, roleID := range identity.RoleIDs() {
 		idMap[roleID] = nil
 	}
+	for _, boundRoleName := range identity.BoundRoleNames() {
+		nameMap[boundRoleName] = nil
+	}
+
 	for _, role := range roles {
 		idMap[role.ID] = role
+		nameMap[role.Name] = role
 	}
 
 	for _, roleID := range args.RoleIDs {
@@ -1410,8 +1475,650 @@ func (a *ACL) RoleResolve(args *structs.ACLRoleBatchGetRequest, reply *structs.A
 			return acl.ErrPermissionDenied
 		}
 	}
+	for _, roleName := range args.RoleNames {
+		if role, ok := nameMap[roleName]; ok {
+			// only add non-deleted roles
+			if role != nil {
+				reply.Roles = append(reply.Roles, role)
+			}
+		} else {
+			// send a permission denied to indicate that the request included
+			// role names not associated with this token
+			return acl.ErrPermissionDenied
+		}
+	}
 
 	a.srv.setQueryMeta(&reply.QueryMeta)
+
+	return nil
+}
+
+func (a *ACL) RoleBindingRuleRead(args *structs.ACLRoleBindingRuleGetRequest, reply *structs.ACLRoleBindingRuleResponse) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if done, err := a.srv.forward("ACL.RoleBindingRuleRead", args, args, reply); done {
+		return err
+	}
+
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLRead() {
+		return acl.ErrPermissionDenied
+	}
+
+	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, rule, err := state.ACLRoleBindingRuleGetByID(ws, args.RoleBindingRuleID)
+
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.RoleBindingRule = index, rule
+			return nil
+		})
+}
+
+// TODO (DEPRECATE?)
+func (a *ACL) RoleBindingRuleBatchRead(args *structs.ACLRoleBindingRuleBatchGetRequest, reply *structs.ACLRoleBindingRuleBatchResponse) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if done, err := a.srv.forward("ACL.RoleBindingRuleBatchRead", args, args, reply); done {
+		return err
+	}
+
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLRead() {
+		return acl.ErrPermissionDenied
+	}
+
+	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, rules, err := state.ACLRoleBindingRuleBatchGet(ws, args.RoleBindingRuleIDs)
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.RoleBindingRules = index, rules
+			return nil
+		})
+}
+
+func (a *ACL) RoleBindingRuleSet(args *structs.ACLRoleBindingRuleSetRequest, reply *structs.ACLRoleBindingRule) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if !a.srv.InACLDatacenter() {
+		args.Datacenter = a.srv.config.ACLDatacenter
+	}
+
+	if done, err := a.srv.forward("ACL.RoleBindingRuleSet", args, args, reply); done {
+		return err
+	}
+
+	defer metrics.MeasureSince([]string{"acl", "rolebindingrule", "upsert"}, time.Now())
+
+	// Verify token is permitted to modify ACLs
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLWrite() {
+		return acl.ErrPermissionDenied
+	}
+
+	rule := &args.RoleBindingRule
+	state := a.srv.fsm.State()
+
+	if rule.IDPName == "" {
+		return fmt.Errorf("Invalid Role Binding Rule: no IDPName is set")
+	}
+
+	_, idp, err := state.ACLIdentityProviderGetByName(nil, rule.IDPName)
+	if err != nil {
+		return fmt.Errorf("acl identity provider lookup failed: %v", err)
+	} else if idp == nil {
+		return fmt.Errorf("cannot find identity provider with name %q", rule.IDPName)
+	}
+
+	if rule.ID == "" {
+		// with no role binding rule ID one will be generated
+		var err error
+
+		rule.ID, err = lib.GenerateUUID(a.srv.checkRoleBindingRuleUUID)
+		if err != nil {
+			return err
+		}
+	} else {
+		if _, err := uuid.ParseUUID(rule.ID); err != nil {
+			return fmt.Errorf("Role Binding Rule ID invalid UUID")
+		}
+
+		// Verify the role exists
+		_, existing, err := state.ACLRoleBindingRuleGetByID(nil, rule.ID)
+		if err != nil {
+			return fmt.Errorf("acl role binding rule lookup failed: %v", err)
+		} else if existing == nil {
+			return fmt.Errorf("cannot find role binding rule %s", rule.ID)
+		}
+
+		if existing.IDPName != rule.IDPName {
+			return fmt.Errorf("the IDPName field of an Role Binding Rule is immutable")
+		}
+	}
+
+	for _, match := range rule.Match {
+		if len(match.Selector) == 0 {
+			return fmt.Errorf("Invalid Role Binding Rule: Match must have Selector set")
+		}
+		fields := make(map[string]struct{})
+		for _, sel := range match.Selector {
+			lhs, _, ok := parseExactMatchSelector(sel)
+			if !ok {
+				return fmt.Errorf("invalid match selector %q", sel)
+			}
+			if _, ok := fields[lhs]; ok {
+				return fmt.Errorf("role binding rule selector uses the same field twice: %q", lhs)
+			}
+			fields[lhs] = struct{}{}
+
+			unknown := findUnknownIdentityProviderFields(idp.Type, []string{lhs})
+			if len(unknown) > 0 {
+				return fmt.Errorf("role binding rule selector uses unknown field: %q", unknown[0])
+			}
+		}
+	}
+
+	if rule.RoleName == "" {
+		return fmt.Errorf("Invalid Role Binding Rule: no RoleName is set")
+	}
+	if valid, err := isValidRoleBindingRuleRoleName(idp.Type, rule.RoleName); err != nil {
+		return fmt.Errorf("role binding rule role name is invalid: %v", err)
+	} else if !valid {
+		return fmt.Errorf("role binding rule role name is invalid")
+	}
+
+	req := &structs.ACLRoleBindingRuleBatchSetRequest{
+		RoleBindingRules: structs.ACLRoleBindingRules{rule},
+	}
+
+	resp, err := a.srv.raftApply(structs.ACLRoleBindingRuleSetRequestType, req)
+	if err != nil {
+		return fmt.Errorf("Failed to apply role binding rule upsert request: %v", err)
+	}
+
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	if _, rule, err := a.srv.fsm.State().ACLRoleBindingRuleGetByID(nil, rule.ID); err == nil && rule != nil {
+		*reply = *rule
+	}
+
+	return nil
+}
+
+func isValidRoleBindingRuleRoleName(idpType, roleName string) (bool, error) {
+	if idpType == "" || roleName == "" {
+		return false, nil
+	}
+
+	vars, err := simpleCollectVars(roleName)
+	if err != nil {
+		return false, err
+	}
+
+	if len(vars) == 0 {
+		return isValidRoleName(roleName), nil
+	}
+
+	unknown := findUnknownIdentityProviderFields(idpType, vars)
+	if len(unknown) > 0 {
+		return false, fmt.Errorf("contains unknown variables: %v", unknown)
+	}
+
+	// Convert the template into a real name to verify the overall template
+	// structure.
+	fakeVars := make(map[string]string)
+	for _, v := range vars {
+		fakeVars[v] = "fake"
+	}
+
+	generatedName, err := simpleInterpolateVars(roleName, fakeVars)
+	if err != nil {
+		return false, err
+	}
+
+	return isValidRoleName(generatedName), nil
+}
+
+func (a *ACL) RoleBindingRuleDelete(args *structs.ACLRoleBindingRuleDeleteRequest, reply *bool) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if !a.srv.InACLDatacenter() {
+		args.Datacenter = a.srv.config.ACLDatacenter
+	}
+
+	if done, err := a.srv.forward("ACL.RoleBindingRuleDelete", args, args, reply); done {
+		return err
+	}
+
+	defer metrics.MeasureSince([]string{"acl", "rolebindingrule", "delete"}, time.Now())
+
+	// Verify token is permitted to modify ACLs
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLWrite() {
+		return acl.ErrPermissionDenied
+	}
+
+	_, rule, err := a.srv.fsm.State().ACLRoleBindingRuleGetByID(nil, args.RoleBindingRuleID)
+	if err != nil {
+		return err
+	}
+
+	if rule == nil {
+		return nil
+	}
+
+	req := structs.ACLRoleBindingRuleBatchDeleteRequest{
+		RoleBindingRuleIDs: []string{args.RoleBindingRuleID},
+	}
+
+	resp, err := a.srv.raftApply(structs.ACLRoleBindingRuleDeleteRequestType, &req)
+	if err != nil {
+		return fmt.Errorf("Failed to apply role binding rule delete request: %v", err)
+	}
+
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	*reply = true
+
+	return nil
+}
+
+func (a *ACL) RoleBindingRuleList(args *structs.ACLRoleBindingRuleListRequest, reply *structs.ACLRoleBindingRuleListResponse) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if done, err := a.srv.forward("ACL.RoleBindingRuleList", args, args, reply); done {
+		return err
+	}
+
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLRead() {
+		return acl.ErrPermissionDenied
+	}
+
+	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, rules, err := state.ACLRoleBindingRuleList(ws, args.IDPName)
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.RoleBindingRules = index, rules
+			return nil
+		})
+}
+
+func (a *ACL) IdentityProviderRead(args *structs.ACLIdentityProviderGetRequest, reply *structs.ACLIdentityProviderResponse) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if done, err := a.srv.forward("ACL.IdentityProviderRead", args, args, reply); done {
+		return err
+	}
+
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLRead() {
+		return acl.ErrPermissionDenied
+	}
+
+	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, idp, err := state.ACLIdentityProviderGetByName(ws, args.IdentityProviderName)
+
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.IdentityProvider = index, idp
+			return nil
+		})
+}
+
+// TODO (DEPRECATE?)
+func (a *ACL) IdentityProviderBatchRead(args *structs.ACLIdentityProviderBatchGetRequest, reply *structs.ACLIdentityProviderBatchResponse) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if done, err := a.srv.forward("ACL.IdentityProviderBatchRead", args, args, reply); done {
+		return err
+	}
+
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLRead() {
+		return acl.ErrPermissionDenied
+	}
+
+	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, idps, err := state.ACLIdentityProviderBatchGet(ws, args.IdentityProviderNames)
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.IdentityProviders = index, idps
+			return nil
+		})
+}
+
+func (a *ACL) IdentityProviderSet(args *structs.ACLIdentityProviderSetRequest, reply *structs.ACLIdentityProvider) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if !a.srv.InACLDatacenter() {
+		args.Datacenter = a.srv.config.ACLDatacenter
+	}
+
+	if done, err := a.srv.forward("ACL.IdentityProviderSet", args, args, reply); done {
+		return err
+	}
+
+	defer metrics.MeasureSince([]string{"acl", "identityprovider", "upsert"}, time.Now())
+
+	// Verify token is permitted to modify ACLs
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLWrite() {
+		return acl.ErrPermissionDenied
+	}
+
+	idp := &args.IdentityProvider
+	state := a.srv.fsm.State()
+
+	// ensure a name is set
+	if idp.Name == "" {
+		return fmt.Errorf("Invalid Identity Provider: no Name is set")
+	}
+	if !isValidIDPName(idp.Name) {
+		return fmt.Errorf("Invalid Identity provider: invalid Name. Only alphanumeric characters, '-' and '_' are allowed")
+	}
+
+	if idp.Type != "kubernetes" {
+		return fmt.Errorf("Invalid Identity Provider: Type should be one of [kubernetes]")
+	}
+
+	if err := a.srv.validateIdentityProviderSpecificFields(idp); err != nil {
+		return fmt.Errorf("Invalid Identity Provider: %v", err)
+	}
+
+	// Check to see if the idp exists first.
+	_, existing, err := state.ACLIdentityProviderGetByName(nil, idp.Name)
+	if err != nil {
+		return fmt.Errorf("acl identity provider lookup failed: %v", err)
+	}
+
+	if existing != nil {
+		if existing.Type != idp.Type {
+			return fmt.Errorf("the Type field of an Identity Provider is immutable")
+		}
+	}
+
+	req := &structs.ACLIdentityProviderBatchSetRequest{
+		IdentityProviders: structs.ACLIdentityProviders{idp},
+	}
+
+	resp, err := a.srv.raftApply(structs.ACLIdentityProviderSetRequestType, req)
+	if err != nil {
+		return fmt.Errorf("Failed to apply identity provider upsert request: %v", err)
+	}
+
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	if _, idp, err := a.srv.fsm.State().ACLIdentityProviderGetByName(nil, idp.Name); err == nil && idp != nil {
+		*reply = *idp
+	}
+
+	return nil
+}
+
+func (a *ACL) IdentityProviderDelete(args *structs.ACLIdentityProviderDeleteRequest, reply *bool) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if !a.srv.InACLDatacenter() {
+		args.Datacenter = a.srv.config.ACLDatacenter
+	}
+
+	if done, err := a.srv.forward("ACL.IdentityProviderDelete", args, args, reply); done {
+		return err
+	}
+
+	defer metrics.MeasureSince([]string{"acl", "identityprovider", "delete"}, time.Now())
+
+	// Verify token is permitted to modify ACLs
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLWrite() {
+		return acl.ErrPermissionDenied
+	}
+
+	_, idp, err := a.srv.fsm.State().ACLIdentityProviderGetByName(nil, args.IdentityProviderName)
+	if err != nil {
+		return err
+	}
+
+	if idp == nil {
+		return nil
+	}
+
+	req := structs.ACLIdentityProviderBatchDeleteRequest{
+		IdentityProviderNames: []string{args.IdentityProviderName},
+	}
+
+	resp, err := a.srv.raftApply(structs.ACLIdentityProviderDeleteRequestType, &req)
+	if err != nil {
+		return fmt.Errorf("Failed to apply identity provider delete request: %v", err)
+	}
+
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	*reply = true
+
+	return nil
+}
+
+func (a *ACL) IdentityProviderList(args *structs.ACLIdentityProviderListRequest, reply *structs.ACLIdentityProviderListResponse) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if done, err := a.srv.forward("ACL.IdentityProviderList", args, args, reply); done {
+		return err
+	}
+
+	if rule, err := a.srv.ResolveToken(args.Token); err != nil {
+		return err
+	} else if rule == nil || !rule.ACLRead() {
+		return acl.ErrPermissionDenied
+	}
+
+	return a.srv.blockingQuery(&args.QueryOptions, &reply.QueryMeta,
+		func(ws memdb.WatchSet, state *state.Store) error {
+			index, idps, err := state.ACLIdentityProviderList(ws)
+			if err != nil {
+				return err
+			}
+
+			var stubs structs.ACLIdentityProviderListStubs
+			for _, idp := range idps {
+				stubs = append(stubs, idp.Stub())
+			}
+
+			reply.Index, reply.IdentityProviders = index, stubs
+			return nil
+		})
+}
+
+func (a *ACL) Login(args *structs.ACLLoginRequest, reply *structs.ACLToken) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if args.Token != "" { // This shouldn't happen.
+		return errors.New("do not provide a token when logging in")
+	}
+
+	if done, err := a.srv.forward("ACL.Login", args, args, reply); done {
+		return err
+	}
+
+	if !a.srv.LocalTokensEnabled() {
+		return fmt.Errorf("Local tokens are disabled")
+	}
+
+	defer metrics.MeasureSince([]string{"acl", "login"}, time.Now())
+
+	auth := args.Auth
+
+	// 1. take args.Data.IDPName to get an IdentityProvider Validator
+	idp, err := a.srv.getIdentityProvider(auth.IDPType, auth.IDPName)
+	if err != nil {
+		return err
+	}
+
+	// 2. Send args.Data.IDPToken to idp validator and get back a fields map
+	validationReq := &LoginValidationRequest{
+		Token: auth.IDPToken,
+	}
+	validationResp, err := idp.ValidateLogin(validationReq)
+	if err != nil {
+		return err
+	}
+
+	// 3. send map through role bindings
+	roleLinks, err := a.srv.evaluateRoleBindings(auth.IDPName, validationResp)
+	if err != nil {
+		return err
+	}
+
+	if len(roleLinks) == 0 {
+		return acl.ErrPermissionDenied
+	}
+
+	description := "token created via login"
+	loginMeta, err := encodeLoginMeta(auth.Meta)
+	if err != nil {
+		return err
+	}
+	if loginMeta != "" {
+		description += ": " + loginMeta
+	}
+
+	// 4. create token
+	createReq := structs.ACLTokenSetRequest{
+		Datacenter: args.Datacenter,
+		ACLToken: structs.ACLToken{
+			Description: description,
+			Local:       true,
+			IDPName:     auth.IDPName,
+			Roles:       roleLinks,
+		},
+		WriteRequest: args.WriteRequest,
+	}
+
+	// 5. return token information like a TokenCreate would
+	return a.tokenSetInternal(&createReq, reply, true)
+}
+
+func encodeLoginMeta(meta map[string]string) (string, error) {
+	if len(meta) == 0 {
+		return "", nil
+	}
+
+	d, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	return string(d), nil
+}
+
+func (a *ACL) Logout(args *structs.ACLLogoutRequest, reply *bool) error {
+	if err := a.aclPreCheck(); err != nil {
+		return err
+	}
+
+	if args.Token == "" {
+		return acl.ErrNotFound
+	}
+
+	// clients will not know whether the server has local token store. In the case
+	// where it doesn't we will transparently forward requests.
+	if !a.srv.LocalTokensEnabled() {
+		args.Datacenter = a.srv.config.ACLDatacenter
+	}
+
+	if done, err := a.srv.forward("ACL.Logout", args, args, reply); done {
+		return err
+	}
+
+	_, token, err := a.srv.fsm.State().ACLTokenGetBySecret(nil, args.Token)
+	if err != nil {
+		return err
+	} else if token == nil {
+		return acl.ErrNotFound
+	} else if token.IDPName == "" {
+		// Can't "logout" of a token that wasn't a result of login.
+		return acl.ErrPermissionDenied
+	} else if !a.srv.InACLDatacenter() && !token.Local {
+		// global token writes must be forwarded to the primary DC
+		args.Datacenter = a.srv.config.ACLDatacenter
+		return a.srv.forwardDC("ACL.Logout", a.srv.config.ACLDatacenter, args, reply)
+	}
+
+	// No need to check expiration time because it's being deleted.
+
+	req := &structs.ACLTokenBatchDeleteRequest{
+		TokenIDs: []string{token.AccessorID},
+	}
+
+	resp, err := a.srv.raftApply(structs.ACLTokenDeleteRequestType, req)
+	if err != nil {
+		return fmt.Errorf("Failed to apply token delete request: %v", err)
+	}
+
+	// Purge the identity from the cache to prevent using the previous definition of the identity
+	if token != nil {
+		a.srv.acls.cache.RemoveIdentity(token.SecretID)
+	}
+
+	if respErr, ok := resp.(error); ok {
+		return respErr
+	}
+
+	*reply = true
 
 	return nil
 }

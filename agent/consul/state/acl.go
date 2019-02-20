@@ -61,6 +61,8 @@ func (s *TokenPoliciesIndex) PrefixFromArgs(args ...interface{}) ([]byte, error)
 }
 
 type TokenRolesIndex struct {
+	// boundNames=true means index the BoundName field, otherwise index the ID
+	boundNames bool
 }
 
 func (s *TokenRolesIndex) FromObject(obj interface{}) (bool, [][]byte, error) {
@@ -78,7 +80,11 @@ func (s *TokenRolesIndex) FromObject(obj interface{}) (bool, [][]byte, error) {
 
 	vals := make([][]byte, 0, numLinks)
 	for _, link := range links {
-		vals = append(vals, []byte(link.ID+"\x00"))
+		if link.BoundName != "" && s.boundNames {
+			vals = append(vals, []byte(link.BoundName+"\x00"))
+		} else if link.ID != "" && !s.boundNames {
+			vals = append(vals, []byte(link.ID+"\x00"))
+		}
 	}
 
 	return true, vals, nil
@@ -240,11 +246,26 @@ func tokensTableSchema() *memdb.TableSchema {
 				Indexer:      &TokenPoliciesIndex{},
 			},
 			"roles": &memdb.IndexSchema{
-				Name: "roles",
-				// Need to allow missing for the anonymous token
+				Name:         "roles",
 				AllowMissing: true,
 				Unique:       false,
-				Indexer:      &TokenRolesIndex{},
+				Indexer:      &TokenRolesIndex{boundNames: false},
+			},
+			"idp": &memdb.IndexSchema{
+				Name:         "idp",
+				AllowMissing: true,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field:     "IDPName",
+					Lowercase: false,
+				},
+			},
+			// TODO(rb): remove if not necessary for UI work
+			"bound-roles": &memdb.IndexSchema{
+				Name:         "bound-roles",
+				AllowMissing: true,
+				Unique:       false,
+				Indexer:      &TokenRolesIndex{boundNames: true},
 			},
 			"local": &memdb.IndexSchema{
 				Name:         "local",
@@ -349,10 +370,54 @@ func rolesTableSchema() *memdb.TableSchema {
 	}
 }
 
+func roleBindingRulesTableSchema() *memdb.TableSchema {
+	return &memdb.TableSchema{
+		Name: "acl-role-binding-rules",
+		Indexes: map[string]*memdb.IndexSchema{
+			"id": &memdb.IndexSchema{
+				Name:         "id",
+				AllowMissing: false,
+				Unique:       true,
+				Indexer: &memdb.UUIDFieldIndex{
+					Field: "ID",
+				},
+			},
+			"idp": &memdb.IndexSchema{
+				Name:         "idp",
+				AllowMissing: false,
+				Unique:       false,
+				Indexer: &memdb.StringFieldIndex{
+					Field:     "IDPName",
+					Lowercase: true,
+				},
+			},
+		},
+	}
+}
+
+func identityProvidersTableSchema() *memdb.TableSchema {
+	return &memdb.TableSchema{
+		Name: "acl-identity-providers",
+		Indexes: map[string]*memdb.IndexSchema{
+			"id": &memdb.IndexSchema{
+				Name:         "id",
+				AllowMissing: false,
+				Unique:       true,
+				Indexer: &memdb.StringFieldIndex{
+					Field:     "Name",
+					Lowercase: true,
+				},
+			},
+		},
+	}
+}
+
 func init() {
 	registerSchema(tokensTableSchema)
 	registerSchema(policiesTableSchema)
 	registerSchema(rolesTableSchema)
+	registerSchema(roleBindingRulesTableSchema)
+	registerSchema(identityProvidersTableSchema)
 }
 
 // ACLTokens is used when saving a snapshot
@@ -412,6 +477,46 @@ func (s *Restore) ACLRole(role *structs.ACLRole) error {
 	}
 
 	if err := indexUpdateMaxTxn(s.tx, role.ModifyIndex, "acl-roles"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+	return nil
+}
+
+// ACLRoleBindingRules is used when saving a snapshot
+func (s *Snapshot) ACLRoleBindingRules() (memdb.ResultIterator, error) {
+	iter, err := s.tx.Get("acl-role-binding-rules", "id")
+	if err != nil {
+		return nil, err
+	}
+	return iter, nil
+}
+
+func (s *Restore) ACLRoleBindingRule(rule *structs.ACLRoleBindingRule) error {
+	if err := s.tx.Insert("acl-role-binding-rules", rule); err != nil {
+		return fmt.Errorf("failed restoring acl role binding rule: %s", err)
+	}
+
+	if err := indexUpdateMaxTxn(s.tx, rule.ModifyIndex, "acl-role-binding-rules"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+	return nil
+}
+
+// ACLIdentityProviders is used when saving a snapshot
+func (s *Snapshot) ACLIdentityProviders() (memdb.ResultIterator, error) {
+	iter, err := s.tx.Get("acl-identity-providers", "id")
+	if err != nil {
+		return nil, err
+	}
+	return iter, nil
+}
+
+func (s *Restore) ACLIdentityProvider(idp *structs.ACLIdentityProvider) error {
+	if err := s.tx.Insert("acl-identity-providers", idp); err != nil {
+		return fmt.Errorf("failed restoring acl identity provider: %s", err)
+	}
+
+	if err := indexUpdateMaxTxn(s.tx, idp.ModifyIndex, "acl-identity-providers"); err != nil {
 		return fmt.Errorf("failed updating index: %s", err)
 	}
 	return nil
@@ -555,6 +660,8 @@ func (s *Store) resolveTokenRoleLinks(tx *memdb.Txn, token *structs.ACLToken, al
 			} else if !allowMissing {
 				return fmt.Errorf("No such role with ID: %s", link.ID)
 			}
+		} else if link.BoundName != "" {
+			// skip expected
 		} else {
 			return fmt.Errorf("Encountered a Token with roles linked by Name in the state store")
 		}
@@ -578,7 +685,12 @@ func (s *Store) fixupTokenRoleLinks(tx *memdb.Txn, original *structs.ACLToken) (
 	}
 
 	for linkIndex, link := range original.Roles {
-		if link.ID == "" {
+		if link.BoundName != "" {
+			if owned {
+				token.Roles = append(token.Roles, link)
+			}
+			continue
+		} else if link.ID == "" {
 			return nil, fmt.Errorf("Detected corrupted token within the state store - missing role link ID")
 		}
 
@@ -789,6 +901,15 @@ func (s *Store) aclTokenSetTxn(tx *memdb.Txn, idx uint64, token *structs.ACLToke
 		return err
 	}
 
+	if token.IDPName != "" {
+		idp, err := s.getIdentityProviderWithTxn(tx, nil, token.IDPName, "id")
+		if err != nil {
+			return err
+		} else if idp == nil {
+			return fmt.Errorf("No such identity provider with Name: %s", token.IDPName)
+		}
+	}
+
 	for _, svcid := range token.ServiceIdentities {
 		if svcid.ServiceName == "" {
 			return fmt.Errorf("Encountered a Token with an empty service identity name in the state store")
@@ -890,7 +1011,7 @@ func (s *Store) aclTokenGetTxn(tx *memdb.Txn, ws memdb.WatchSet, value, index st
 }
 
 // ACLTokenList is used to list out all of the ACLs in the state store.
-func (s *Store) ACLTokenList(ws memdb.WatchSet, local, global bool, policy, role string) (uint64, structs.ACLTokens, error) {
+func (s *Store) ACLTokenList(ws memdb.WatchSet, local, global bool, policy, role, idpName string) (uint64, structs.ACLTokens, error) {
 	tx := s.db.Txn(false)
 	defer tx.Abort()
 
@@ -901,57 +1022,53 @@ func (s *Store) ACLTokenList(ws memdb.WatchSet, local, global bool, policy, role
 	// to false but for defaulted structs (zero values for both) we want it to list out
 	// all tokens so our checks just ensure that global == local
 
-	if policy != "" && role != "" {
-		return 0, nil, fmt.Errorf("cannot filter by role and policy at the same time")
-	}
+	needLocalityFilter := false
+	if policy == "" && role == "" && idpName == "" {
+		if global == local {
+			iter, err = tx.Get("acl-tokens", "id")
+		} else if global {
+			iter, err = tx.Get("acl-tokens", "local", false)
+		} else {
+			iter, err = tx.Get("acl-tokens", "local", true)
+		}
 
-	if policy != "" {
+	} else if policy != "" && role == "" && idpName == "" {
 		iter, err = tx.Get("acl-tokens", "policies", policy)
-		if err == nil && global != local {
-			iter = memdb.NewFilterIterator(iter, func(raw interface{}) bool {
-				token, ok := raw.(*structs.ACLToken)
-				if !ok {
-					return true
-				}
+		needLocalityFilter = true
 
-				if global && !token.Local {
-					return false
-				} else if local && token.Local {
-					return false
-				}
-
-				return true
-			})
-		}
-	} else if role != "" {
+	} else if policy == "" && role != "" && idpName == "" {
 		iter, err = tx.Get("acl-tokens", "roles", role)
-		if err == nil && global != local {
-			iter = memdb.NewFilterIterator(iter, func(raw interface{}) bool {
-				token, ok := raw.(*structs.ACLToken)
-				if !ok {
-					return true
-				}
+		needLocalityFilter = true
 
-				if global && !token.Local {
-					return false
-				} else if local && token.Local {
-					return false
-				}
+	} else if policy == "" && role == "" && idpName != "" {
+		iter, err = tx.Get("acl-tokens", "idp", idpName)
+		needLocalityFilter = true
 
-				return true
-			})
-		}
-	} else if global == local {
-		iter, err = tx.Get("acl-tokens", "id")
-	} else if global {
-		iter, err = tx.Get("acl-tokens", "local", false)
 	} else {
-		iter, err = tx.Get("acl-tokens", "local", true)
+		return 0, nil, fmt.Errorf("can only filter by one of policy, role, or idpName at a time")
 	}
 
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed acl token lookup: %v", err)
 	}
+
+	if needLocalityFilter && global != local {
+		iter = memdb.NewFilterIterator(iter, func(raw interface{}) bool {
+			token, ok := raw.(*structs.ACLToken)
+			if !ok {
+				return true
+			}
+
+			if global && !token.Local {
+				return false
+			} else if local && token.Local {
+				return false
+			}
+
+			return true
+		})
+	}
+
 	ws.Add(iter.WatchCh())
 
 	var result structs.ACLTokens
@@ -1434,13 +1551,23 @@ func (s *Store) ACLRoleGetByName(ws memdb.WatchSet, name string) (uint64, *struc
 	return s.aclRoleGet(ws, name, "name")
 }
 
-func (s *Store) ACLRoleBatchGet(ws memdb.WatchSet, ids []string) (uint64, structs.ACLRoles, error) {
+func (s *Store) ACLRoleBatchGet(ws memdb.WatchSet, ids, names []string) (uint64, structs.ACLRoles, error) {
 	tx := s.db.Txn(false)
 	defer tx.Abort()
 
-	roles := make(structs.ACLRoles, 0)
+	roles := make(structs.ACLRoles, 0, len(ids)+len(names))
 	for _, rid := range ids {
 		role, err := s.getRoleWithTxn(tx, ws, rid, "id")
+		if err != nil {
+			return 0, nil, err
+		}
+
+		if role != nil {
+			roles = append(roles, role)
+		}
+	}
+	for _, rname := range names {
+		role, err := s.getRoleWithTxn(tx, ws, rname, "name")
 		if err != nil {
 			return 0, nil, err
 		}
@@ -1577,6 +1704,439 @@ func (s *Store) aclRoleDeleteTxn(tx *memdb.Txn, idx uint64, value, index string)
 
 	if err := tx.Delete("acl-roles", role); err != nil {
 		return fmt.Errorf("failed deleting acl role: %v", err)
+	}
+	return nil
+}
+
+func (s *Store) ACLRoleBindingRuleBatchSet(idx uint64, rules structs.ACLRoleBindingRules) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	for _, rule := range rules {
+		// this is only used when doing batch insertions for upgrades and replication. Therefore
+		// we take whatever those said.
+		if err := s.aclRoleBindingRuleSetTxn(tx, idx, rule); err != nil {
+			return err
+		}
+	}
+
+	if err := indexUpdateMaxTxn(tx, idx, "acl-role-binding-rules"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) ACLRoleBindingRuleSet(idx uint64, rule *structs.ACLRoleBindingRule) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	if err := s.aclRoleBindingRuleSetTxn(tx, idx, rule); err != nil {
+		return err
+	}
+	if err := indexUpdateMaxTxn(tx, idx, "acl-role-binding-rules"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) aclRoleBindingRuleSetTxn(tx *memdb.Txn, idx uint64, rule *structs.ACLRoleBindingRule) error {
+	// Check that the ID and IDPName are set
+	if rule.ID == "" {
+		return ErrMissingACLRoleBindingRuleID
+	} else if rule.IDPName == "" {
+		return ErrMissingACLRoleBindingRuleIDPName
+	}
+
+	existing, err := tx.First("acl-role-binding-rules", "id", rule.ID)
+	if err != nil {
+		return fmt.Errorf("failed acl role binding rule lookup: %v", err)
+	}
+
+	// Set the indexes
+	if existing != nil {
+		rule.CreateIndex = existing.(*structs.ACLRoleBindingRule).CreateIndex
+		rule.ModifyIndex = idx
+	} else {
+		rule.CreateIndex = idx
+		rule.ModifyIndex = idx
+	}
+
+	if idp, err := tx.First("acl-identity-providers", "id", rule.IDPName); err != nil {
+		return fmt.Errorf("failed acl identity provider lookup: %v", err)
+	} else if idp == nil {
+		return fmt.Errorf("failed inserting acl role binding rule: identity provider not found")
+	}
+
+	if err := tx.Insert("acl-role-binding-rules", rule); err != nil {
+		return fmt.Errorf("failed inserting acl role binding rule: %v", err)
+	}
+	return nil
+}
+
+func (s *Store) ACLRoleBindingRuleGetByID(ws memdb.WatchSet, id string) (uint64, *structs.ACLRoleBindingRule, error) {
+	return s.aclRoleBindingRuleGet(ws, id, "id")
+}
+
+func (s *Store) ACLRoleBindingRuleBatchGet(ws memdb.WatchSet, ids []string) (uint64, structs.ACLRoleBindingRules, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	rules := make(structs.ACLRoleBindingRules, 0)
+	for _, rid := range ids {
+		rule, err := s.getRoleBindingRuleWithTxn(tx, ws, rid, "id")
+		if err != nil {
+			return 0, nil, err
+		}
+
+		if rule != nil {
+			rules = append(rules, rule)
+		}
+	}
+
+	idx := maxIndexTxn(tx, "acl-role-binding-rules")
+
+	return idx, rules, nil
+}
+
+func (s *Store) getRoleBindingRuleWithTxn(tx *memdb.Txn, ws memdb.WatchSet, value, index string) (*structs.ACLRoleBindingRule, error) {
+	watchCh, rawRule, err := tx.FirstWatch("acl-role-binding-rules", index, value)
+	if err != nil {
+		return nil, fmt.Errorf("failed acl role binding rule lookup: %v", err)
+	}
+	ws.Add(watchCh)
+
+	if rawRule != nil {
+		// TODO(rb): deep clone?
+		return rawRule.(*structs.ACLRoleBindingRule), nil
+	}
+
+	return nil, nil
+}
+
+func (s *Store) aclRoleBindingRuleGet(ws memdb.WatchSet, value, index string) (uint64, *structs.ACLRoleBindingRule, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	rule, err := s.getRoleBindingRuleWithTxn(tx, ws, value, index)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	idx := maxIndexTxn(tx, "acl-role-binding-rules")
+
+	return idx, rule, nil
+}
+
+func (s *Store) ACLRoleBindingRuleList(ws memdb.WatchSet, idpName string) (uint64, structs.ACLRoleBindingRules, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	var (
+		iter memdb.ResultIterator
+		err  error
+	)
+	if idpName != "" {
+		iter, err = tx.Get("acl-role-binding-rules", "idp", idpName)
+	} else {
+		iter, err = tx.Get("acl-role-binding-rules", "id")
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed acl role binding rule lookup: %v", err)
+	}
+	ws.Add(iter.WatchCh())
+
+	var result structs.ACLRoleBindingRules
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		// TODO(rb): deep copy
+		rule := raw.(*structs.ACLRoleBindingRule)
+		result = append(result, rule)
+	}
+
+	// Get the table index.
+	idx := maxIndexTxn(tx, "acl-role-binding-rules")
+
+	return idx, result, nil
+}
+
+func (s *Store) ACLRoleBindingRuleDeleteByID(idx uint64, id string) error {
+	return s.aclRoleBindingRuleDelete(idx, id, "id")
+}
+
+func (s *Store) ACLRoleBindingRuleBatchDelete(idx uint64, roleBindingRuleIDs []string) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	for _, roleBindingRuleID := range roleBindingRuleIDs {
+		s.aclRoleBindingRuleDeleteTxn(tx, idx, roleBindingRuleID, "id")
+	}
+
+	if err := indexUpdateMaxTxn(tx, idx, "acl-role-binding-rules"); err != nil {
+		return fmt.Errorf("failed updating index: %v", err)
+	}
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) aclRoleBindingRuleDelete(idx uint64, value, index string) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	if err := s.aclRoleBindingRuleDeleteTxn(tx, idx, value, index); err != nil {
+		return err
+	}
+	if err := indexUpdateMaxTxn(tx, idx, "acl-role-binding-rules"); err != nil {
+		return fmt.Errorf("failed updating index: %v", err)
+	}
+
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) aclRoleBindingRuleDeleteTxn(tx *memdb.Txn, idx uint64, value, index string) error {
+	// Look up the existing role binding rule
+	rawRule, err := tx.First("acl-role-binding-rules", index, value)
+	if err != nil {
+		return fmt.Errorf("failed acl role binding rule lookup: %v", err)
+	}
+
+	if rawRule == nil {
+		return nil
+	}
+
+	rule := rawRule.(*structs.ACLRoleBindingRule)
+
+	if err := tx.Delete("acl-role-binding-rules", rule); err != nil {
+		return fmt.Errorf("failed deleting acl role binding rule: %v", err)
+	}
+	return nil
+}
+
+func (s *Store) aclRoleBindingRuleDeleteAllForIdentityProviderTxn(tx *memdb.Txn, idx uint64, idpName string) error {
+	// collect them all
+	iter, err := tx.Get("acl-role-binding-rules", "idp", idpName)
+	if err != nil {
+		return fmt.Errorf("failed acl role binding rule lookup: %v", err)
+	}
+
+	var rules structs.ACLRoleBindingRules
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		rule := raw.(*structs.ACLRoleBindingRule)
+		rules = append(rules, rule)
+	}
+
+	if len(rules) > 0 {
+		// delete them all
+		for _, rule := range rules {
+			if err := tx.Delete("acl-role-binding-rules", rule); err != nil {
+				return fmt.Errorf("failed deleting acl role binding rule: %v", err)
+			}
+		}
+
+		if err := indexUpdateMaxTxn(tx, idx, "acl-role-binding-rules"); err != nil {
+			return fmt.Errorf("failed updating index: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Store) ACLIdentityProviderBatchSet(idx uint64, idps structs.ACLIdentityProviders) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	for _, idp := range idps {
+		// this is only used when doing batch insertions for upgrades and replication. Therefore
+		// we take whatever those said.
+		if err := s.aclIdentityProviderSetTxn(tx, idx, idp); err != nil {
+			return err
+		}
+	}
+
+	if err := indexUpdateMaxTxn(tx, idx, "acl-identity-providers"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) ACLIdentityProviderSet(idx uint64, idp *structs.ACLIdentityProvider) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	if err := s.aclIdentityProviderSetTxn(tx, idx, idp); err != nil {
+		return err
+	}
+	if err := indexUpdateMaxTxn(tx, idx, "acl-identity-providers"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) aclIdentityProviderSetTxn(tx *memdb.Txn, idx uint64, idp *structs.ACLIdentityProvider) error {
+	// Check that the Name and Type are set
+	if idp.Name == "" {
+		return ErrMissingACLIdentityProviderName
+	} else if idp.Type == "" {
+		return ErrMissingACLIdentityProviderType
+	}
+
+	existing, err := tx.First("acl-identity-providers", "id", idp.Name)
+	if err != nil {
+		return fmt.Errorf("failed acl identity provider lookup: %v", err)
+	}
+
+	// Set the indexes
+	if existing != nil {
+		idp.CreateIndex = existing.(*structs.ACLIdentityProvider).CreateIndex
+		idp.ModifyIndex = idx
+	} else {
+		idp.CreateIndex = idx
+		idp.ModifyIndex = idx
+	}
+
+	if err := tx.Insert("acl-identity-providers", idp); err != nil {
+		return fmt.Errorf("failed inserting acl identity provider: %v", err)
+	}
+	return nil
+}
+
+func (s *Store) ACLIdentityProviderGetByName(ws memdb.WatchSet, name string) (uint64, *structs.ACLIdentityProvider, error) {
+	return s.aclIdentityProviderGet(ws, name, "id")
+}
+
+func (s *Store) ACLIdentityProviderBatchGet(ws memdb.WatchSet, names []string) (uint64, structs.ACLIdentityProviders, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	idps := make(structs.ACLIdentityProviders, 0)
+	for _, name := range names {
+		idp, err := s.getIdentityProviderWithTxn(tx, ws, name, "id")
+		if err != nil {
+			return 0, nil, err
+		}
+
+		if idp != nil {
+			idps = append(idps, idp)
+		}
+	}
+
+	idx := maxIndexTxn(tx, "acl-identity-providers")
+
+	return idx, idps, nil
+}
+
+func (s *Store) getIdentityProviderWithTxn(tx *memdb.Txn, ws memdb.WatchSet, value, index string) (*structs.ACLIdentityProvider, error) {
+	watchCh, rawIdp, err := tx.FirstWatch("acl-identity-providers", index, value)
+	if err != nil {
+		return nil, fmt.Errorf("failed acl identity provider lookup: %v", err)
+	}
+	ws.Add(watchCh)
+
+	if rawIdp != nil {
+		// TODO(rb): deep clone?
+		return rawIdp.(*structs.ACLIdentityProvider), nil
+	}
+
+	return nil, nil
+}
+
+func (s *Store) aclIdentityProviderGet(ws memdb.WatchSet, value, index string) (uint64, *structs.ACLIdentityProvider, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	idp, err := s.getIdentityProviderWithTxn(tx, ws, value, index)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	idx := maxIndexTxn(tx, "acl-identity-providers")
+
+	return idx, idp, nil
+}
+
+func (s *Store) ACLIdentityProviderList(ws memdb.WatchSet) (uint64, structs.ACLIdentityProviders, error) {
+	tx := s.db.Txn(false)
+	defer tx.Abort()
+
+	iter, err := tx.Get("acl-identity-providers", "id")
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed acl identity provider lookup: %v", err)
+	}
+	ws.Add(iter.WatchCh())
+
+	var result structs.ACLIdentityProviders
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		// TODO(rb): deep copy
+		idp := raw.(*structs.ACLIdentityProvider)
+		result = append(result, idp)
+	}
+
+	// Get the table index.
+	idx := maxIndexTxn(tx, "acl-identity-providers")
+
+	return idx, result, nil
+}
+
+func (s *Store) ACLIdentityProviderDeleteByName(idx uint64, name string) error {
+	return s.aclIdentityProviderDelete(idx, name, "id")
+}
+
+func (s *Store) ACLIdentityProviderBatchDelete(idx uint64, names []string) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	for _, name := range names {
+		s.aclIdentityProviderDeleteTxn(tx, idx, name, "id")
+	}
+
+	if err := indexUpdateMaxTxn(tx, idx, "acl-identity-providers"); err != nil {
+		return fmt.Errorf("failed updating index: %v", err)
+	}
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) aclIdentityProviderDelete(idx uint64, value, index string) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	if err := s.aclIdentityProviderDeleteTxn(tx, idx, value, index); err != nil {
+		return err
+	}
+	if err := indexUpdateMaxTxn(tx, idx, "acl-identity-providers"); err != nil {
+		return fmt.Errorf("failed updating index: %v", err)
+	}
+
+	tx.Commit()
+	return nil
+}
+
+func (s *Store) aclIdentityProviderDeleteTxn(tx *memdb.Txn, idx uint64, value, index string) error {
+	// Look up the existing idp
+	rawidp, err := tx.First("acl-identity-providers", index, value)
+	if err != nil {
+		return fmt.Errorf("failed acl identity provider lookup: %v", err)
+	}
+
+	if rawidp == nil {
+		return nil
+	}
+
+	idp := rawidp.(*structs.ACLIdentityProvider)
+
+	if err := s.aclRoleBindingRuleDeleteAllForIdentityProviderTxn(tx, idx, idp.Name); err != nil {
+		return err
+	}
+
+	if err := tx.Delete("acl-identity-providers", idp); err != nil {
+		return fmt.Errorf("failed deleting acl identity provider: %v", err)
 	}
 	return nil
 }

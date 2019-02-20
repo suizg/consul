@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/acl"
+	"github.com/hashicorp/consul/agent/connect"
 	"github.com/hashicorp/consul/agent/structs"
 	tokenStore "github.com/hashicorp/consul/agent/token"
 	"github.com/hashicorp/consul/lib"
@@ -964,6 +965,168 @@ func TestACLEndpoint_TokenSet(t *testing.T) {
 		require.Len(t, token.Roles, 0)
 	})
 
+	t.Run("Create it with IDPName set outside of login", func(t *testing.T) {
+		req := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				Description: "foobar",
+				IDPName:     "k8s",
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		resp := structs.ACLToken{}
+
+		err := acl.TokenSet(&req, &resp)
+		requireErrorContains(t, err, "IDPName field is disallowed outside of Login")
+	})
+
+	t.Run("Create fails using bound Roles outside of login", func(t *testing.T) {
+		req := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				Description: "foobar",
+				Roles: []structs.ACLTokenRoleLink{
+					structs.ACLTokenRoleLink{
+						BoundName: "web",
+					},
+				},
+				Local: true,
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		resp := structs.ACLToken{}
+
+		err := acl.TokenSet(&req, &resp)
+		requireErrorContains(t, err, "Cannot link a role to a token using a bound name outside of login")
+	})
+
+	t.Run("Create fails linking a role with BoundName AND id", func(t *testing.T) {
+		acl := ACL{
+			srv:                                   s1,
+			disableLoginOnlyRestrictionOnTokenSet: true,
+		}
+
+		req := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				IDPName:     "k8s",
+				Description: "foobar",
+				Roles: []structs.ACLTokenRoleLink{
+					structs.ACLTokenRoleLink{
+						ID:        "abc",
+						BoundName: "web",
+					},
+				},
+				Local: true,
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		resp := structs.ACLToken{}
+
+		err := acl.TokenSet(&req, &resp)
+		requireErrorContains(t, err, "Role links can either set BoundName OR ID/Name but not both")
+	})
+
+	t.Run("Create fails linking a role with BoundName AND Name", func(t *testing.T) {
+		acl := ACL{
+			srv:                                   s1,
+			disableLoginOnlyRestrictionOnTokenSet: true,
+		}
+
+		req := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				IDPName:     "k8s",
+				Description: "foobar",
+				Roles: []structs.ACLTokenRoleLink{
+					structs.ACLTokenRoleLink{
+						Name:      "def",
+						BoundName: "web",
+					},
+				},
+				Local: true,
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		resp := structs.ACLToken{}
+
+		err := acl.TokenSet(&req, &resp)
+		requireErrorContains(t, err, "Role links can either set BoundName OR ID/Name but not both")
+	})
+
+	t.Run("Create fails with an empty IDPName when faking login", func(t *testing.T) {
+		acl := ACL{
+			srv:                                   s1,
+			disableLoginOnlyRestrictionOnTokenSet: true,
+		}
+
+		req := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				IDPName:     "",
+				Description: "foobar",
+				Local:       true,
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		resp := structs.ACLToken{}
+
+		err := acl.TokenSet(&req, &resp)
+		requireErrorContains(t, err, "IDPName field is required during Login")
+	})
+
+	t.Run("Create it using bound Roles by faking login", func(t *testing.T) {
+		// This allows for testing things that are only possible via Login, but
+		// just cumbersome to wire up (multiple role binding rules, etc)
+		acl := ACL{
+			srv:                                   s1,
+			disableLoginOnlyRestrictionOnTokenSet: true,
+		}
+
+		ca := connect.TestCA(t, nil)
+		idp, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+
+		req := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				IDPName:     idp.Name,
+				Description: "foobar",
+				Roles: []structs.ACLTokenRoleLink{
+					structs.ACLTokenRoleLink{
+						BoundName: "web",
+					},
+					structs.ACLTokenRoleLink{
+						BoundName: "db",
+					},
+					structs.ACLTokenRoleLink{
+						BoundName: "web", // add web twice to test dedupe
+					},
+				},
+				Local: true,
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		resp := structs.ACLToken{}
+
+		err = acl.TokenSet(&req, &resp)
+		require.NoError(t, err)
+
+		// Get the token directly to validate that it exists
+		tokenResp, err := retrieveTestToken(codec, "root", "dc1", resp.AccessorID)
+		require.NoError(t, err)
+		token := tokenResp.Token
+
+		require.Len(t, token.Roles, 2)
+		require.Equal(t, "web", token.Roles[0].BoundName)
+		require.Equal(t, "db", token.Roles[1].BoundName)
+	})
+
 	t.Run("Create it with invalid service identity (empty)", func(t *testing.T) {
 		req := structs.ACLTokenSetRequest{
 			Datacenter: "dc1",
@@ -1615,12 +1778,7 @@ func TestACLEndpoint_TokenList(t *testing.T) {
 			t2.AccessorID,
 			t3.AccessorID,
 		}
-
-		var retrievedTokens []string
-		for _, v := range resp.Tokens {
-			retrievedTokens = append(retrievedTokens, v.AccessorID)
-		}
-		require.ElementsMatch(t, retrievedTokens, tokens)
+		require.ElementsMatch(t, gatherIDs(t, resp.Tokens), tokens)
 	})
 
 	time.Sleep(20 * time.Millisecond) // now 't3' is expired
@@ -1642,12 +1800,7 @@ func TestACLEndpoint_TokenList(t *testing.T) {
 			t1.AccessorID,
 			t2.AccessorID,
 		}
-
-		var retrievedTokens []string
-		for _, v := range resp.Tokens {
-			retrievedTokens = append(retrievedTokens, v.AccessorID)
-		}
-		require.ElementsMatch(t, retrievedTokens, tokens)
+		require.ElementsMatch(t, gatherIDs(t, resp.Tokens), tokens)
 	})
 }
 
@@ -1694,13 +1847,7 @@ func TestACLEndpoint_TokenBatchRead(t *testing.T) {
 
 		err = acl.TokenBatchRead(&req, &resp)
 		require.NoError(t, err)
-
-		var retrievedTokens []string
-
-		for _, v := range resp.Tokens {
-			retrievedTokens = append(retrievedTokens, v.AccessorID)
-		}
-		require.EqualValues(t, retrievedTokens, tokens)
+		require.ElementsMatch(t, gatherIDs(t, resp.Tokens), tokens)
 	})
 
 	time.Sleep(20 * time.Millisecond) // now 't3' is expired
@@ -1718,13 +1865,7 @@ func TestACLEndpoint_TokenBatchRead(t *testing.T) {
 
 		err = acl.TokenBatchRead(&req, &resp)
 		require.NoError(t, err)
-
-		var retrievedTokens []string
-
-		for _, v := range resp.Tokens {
-			retrievedTokens = append(retrievedTokens, v.AccessorID)
-		}
-		require.EqualValues(t, retrievedTokens, tokens)
+		require.ElementsMatch(t, gatherIDs(t, resp.Tokens), tokens)
 	})
 }
 
@@ -1801,13 +1942,7 @@ func TestACLEndpoint_PolicyBatchRead(t *testing.T) {
 
 	err = acl.PolicyBatchRead(&req, &resp)
 	require.NoError(t, err)
-
-	var retrievedPolicies []string
-
-	for _, v := range resp.Policies {
-		retrievedPolicies = append(retrievedPolicies, v.ID)
-	}
-	require.EqualValues(t, retrievedPolicies, policies)
+	require.ElementsMatch(t, gatherIDs(t, resp.Policies), []string{p1.ID, p2.ID})
 }
 
 func TestACLEndpoint_PolicySet(t *testing.T) {
@@ -2053,12 +2188,7 @@ func TestACLEndpoint_PolicyList(t *testing.T) {
 		p1.ID,
 		p2.ID,
 	}
-	var retrievedPolicies []string
-
-	for _, v := range resp.Policies {
-		retrievedPolicies = append(retrievedPolicies, v.ID)
-	}
-	require.ElementsMatch(t, retrievedPolicies, policies)
+	require.ElementsMatch(t, gatherIDs(t, resp.Policies), policies)
 }
 
 func TestACLEndpoint_PolicyResolve(t *testing.T) {
@@ -2114,13 +2244,7 @@ func TestACLEndpoint_PolicyResolve(t *testing.T) {
 	}
 	err = acl.PolicyResolve(&req, &resp)
 	require.NoError(t, err)
-
-	var retrievedPolicies []string
-
-	for _, v := range resp.Policies {
-		retrievedPolicies = append(retrievedPolicies, v.ID)
-	}
-	require.EqualValues(t, retrievedPolicies, policies)
+	require.ElementsMatch(t, gatherIDs(t, resp.Policies), policies)
 }
 
 func TestACLEndpoint_RoleRead(t *testing.T) {
@@ -2189,13 +2313,7 @@ func TestACLEndpoint_RoleBatchRead(t *testing.T) {
 
 	err = acl.RoleBatchRead(&req, &resp)
 	require.NoError(t, err)
-
-	var retrievedRoles []string
-
-	for _, v := range resp.Roles {
-		retrievedRoles = append(retrievedRoles, v.ID)
-	}
-	require.EqualValues(t, retrievedRoles, roles)
+	require.ElementsMatch(t, gatherIDs(t, resp.Roles), roles)
 }
 
 func TestACLEndpoint_RoleSet(t *testing.T) {
@@ -2553,14 +2671,1560 @@ func TestACLEndpoint_RoleList(t *testing.T) {
 
 	err = acl.RoleList(&req, &resp)
 	require.NoError(t, err)
+	require.ElementsMatch(t, gatherIDs(t, resp.Roles), []string{r1.ID, r2.ID})
+}
 
-	roles := []string{r1.ID, r2.ID}
-	var retrievedRoles []string
+func TestACLEndpoint_RoleResolve(t *testing.T) {
+	t.Parallel()
 
-	for _, v := range resp.Roles {
-		retrievedRoles = append(retrievedRoles, v.ID)
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	ca := connect.TestCA(t, nil)
+
+	existingIDP, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	t.Run("Normal", func(t *testing.T) {
+		r1, err := upsertTestRole(codec, "root", "dc1")
+		require.NoError(t, err)
+
+		r2, err := upsertTestRole(codec, "root", "dc1")
+		require.NoError(t, err)
+
+		acl := ACL{srv: s1}
+
+		// Assign the roles to a token
+		tokenUpsertReq := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				Roles: []structs.ACLTokenRoleLink{
+					structs.ACLTokenRoleLink{
+						ID: r1.ID,
+					},
+					structs.ACLTokenRoleLink{
+						ID: r2.ID,
+					},
+				},
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+		token := structs.ACLToken{}
+		err = acl.TokenSet(&tokenUpsertReq, &token)
+		require.NoError(t, err)
+		require.NotEmpty(t, token.SecretID)
+
+		resp := structs.ACLRoleBatchResponse{}
+		req := structs.ACLRoleBatchGetRequest{
+			Datacenter:   "dc1",
+			RoleIDs:      []string{r1.ID, r2.ID},
+			QueryOptions: structs.QueryOptions{Token: token.SecretID},
+		}
+		err = acl.RoleResolve(&req, &resp)
+		require.NoError(t, err)
+		require.ElementsMatch(t, gatherIDs(t, resp.Roles), []string{r1.ID, r2.ID})
+	})
+
+	t.Run("With Bound Roles", func(t *testing.T) {
+		r1, err := upsertTestRole(codec, "root", "dc1")
+		require.NoError(t, err)
+
+		r2, err := upsertTestRole(codec, "root", "dc1")
+		require.NoError(t, err)
+
+		acl := ACL{
+			srv:                                   s1,
+			disableLoginOnlyRestrictionOnTokenSet: true,
+		}
+
+		// Assign the roles to a token, with one bound role that doesn't exist
+		tokenUpsertReq := structs.ACLTokenSetRequest{
+			Datacenter: "dc1",
+			ACLToken: structs.ACLToken{
+				IDPName: existingIDP.Name,
+				Local:   true,
+				Roles: []structs.ACLTokenRoleLink{
+					structs.ACLTokenRoleLink{
+						ID: r1.ID,
+					},
+					structs.ACLTokenRoleLink{
+						BoundName: "my-magic-role",
+					},
+				},
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+		token := structs.ACLToken{}
+		err = acl.TokenSet(&tokenUpsertReq, &token)
+		require.NoError(t, err)
+		require.NotEmpty(t, token.SecretID)
+
+		resp := structs.ACLRoleBatchResponse{}
+		req := structs.ACLRoleBatchGetRequest{
+			Datacenter:   "dc1",
+			RoleIDs:      []string{r1.ID},
+			RoleNames:    []string{"my-magic-role"},
+			QueryOptions: structs.QueryOptions{Token: token.SecretID},
+		}
+		err = acl.RoleResolve(&req, &resp)
+		require.NoError(t, err)
+		// note the synthetic role is not returned
+		require.ElementsMatch(t, gatherIDs(t, resp.Roles), []string{r1.ID})
+
+		// now rename r2 to have a name that matches our bound name
+		{
+			r2.Name = "my-magic-role"
+			arg := structs.ACLRoleSetRequest{
+				Datacenter:   "dc1",
+				Role:         *r2,
+				WriteRequest: structs.WriteRequest{Token: "root"},
+			}
+
+			var out structs.ACLRole
+			err = msgpackrpc.CallWithCodec(codec, "ACL.RoleSet", &arg, &out)
+			require.NoError(t, err)
+			require.Equal(t, r2.ID, out.ID)
+
+			r2 = &out
+		}
+
+		resp = structs.ACLRoleBatchResponse{}
+		req = structs.ACLRoleBatchGetRequest{
+			Datacenter:   "dc1",
+			RoleIDs:      []string{r1.ID},
+			RoleNames:    []string{"my-magic-role"},
+			QueryOptions: structs.QueryOptions{Token: token.SecretID},
+		}
+		err = acl.RoleResolve(&req, &resp)
+		require.NoError(t, err)
+		// note the synthetic role is returned now that it exists
+		require.ElementsMatch(t, gatherIDs(t, resp.Roles), []string{r1.ID, r2.ID})
+	})
+}
+
+func TestACLEndpoint_IdentityProviderSet(t *testing.T) {
+	t.Parallel()
+
+	tempDir, err := ioutil.TempDir("", "consul")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	acl := ACL{srv: s1}
+
+	ca := connect.TestCA(t, nil)
+	ca2 := connect.TestCA(t, nil)
+	caPath := filepath.Join(tempDir, "ca.pem")
+	caPath2 := filepath.Join(tempDir, "ca.pem")
+	caPathBad := filepath.Join(tempDir, "ca-bad.pem")
+	require.NoError(t, ioutil.WriteFile(caPath, []byte(ca.RootCert), 0644))
+	require.NoError(t, ioutil.WriteFile(caPath2, []byte(ca2.RootCert), 0644))
+	require.NoError(t, ioutil.WriteFile(caPathBad, []byte("invalid"), 0644))
+
+	newK8S := func(name string) structs.ACLIdentityProvider {
+		return structs.ACLIdentityProvider{
+			Name:                        name,
+			Description:                 "k8s test",
+			Type:                        "kubernetes",
+			KubernetesHost:              "https://abc:8443",
+			KubernetesCACertFile:        caPath,
+			KubernetesCACert:            "",
+			KubernetesServiceAccountJWT: goodJWT_A,
+		}
 	}
-	require.ElementsMatch(t, retrievedRoles, roles)
+
+	t.Run("Create k8s", func(t *testing.T) {
+		reqIDP := newK8S("k8s")
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.NoError(t, err)
+
+		// Get the idp directly to validate that it exists
+		idpResp, err := retrieveTestIDP(codec, "root", "dc1", resp.Name)
+		require.NoError(t, err)
+		idp := idpResp.IdentityProvider
+
+		require.Equal(t, idp.Name, "k8s")
+		require.Equal(t, idp.Description, "k8s test")
+		require.Equal(t, idp.Type, "kubernetes")
+		require.Equal(t, idp.KubernetesHost, "https://abc:8443")
+		require.Equal(t, idp.KubernetesCACertFile, caPath)
+		require.Equal(t, idp.KubernetesCACert, "")
+		require.Equal(t, idp.KubernetesServiceAccountJWT, goodJWT_A)
+	})
+
+	// Note that this test technically fails right now because the type is
+	// invalid.  When we add another idp type this test will start failing for
+	// a new reason.
+	t.Run("Update k8s fails; not allowed to change types", func(t *testing.T) {
+		reqIDP := newK8S("k8s")
+		reqIDP.Type = "oidc"
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Update k8s", func(t *testing.T) {
+		reqIDP := newK8S("k8s")
+		reqIDP.Description = "k8s test modified"
+		reqIDP.KubernetesHost = "https://def:1111"
+		reqIDP.KubernetesCACertFile = ""
+		reqIDP.KubernetesCACert = ca2.RootCert
+		reqIDP.KubernetesServiceAccountJWT = goodJWT_B
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.NoError(t, err)
+
+		// Get the idp directly to validate that it exists
+		idpResp, err := retrieveTestIDP(codec, "root", "dc1", resp.Name)
+		require.NoError(t, err)
+		idp := idpResp.IdentityProvider
+
+		require.Equal(t, idp.Name, "k8s")
+		require.Equal(t, idp.Description, "k8s test modified")
+		require.Equal(t, idp.Type, "kubernetes")
+		require.Equal(t, idp.KubernetesHost, "https://def:1111")
+		require.Equal(t, idp.KubernetesCACertFile, "")
+		require.Equal(t, idp.KubernetesCACert, ca2.RootCert)
+		require.Equal(t, idp.KubernetesServiceAccountJWT, goodJWT_B)
+	})
+
+	t.Run("Create with no name", func(t *testing.T) {
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: newK8S(""),
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create with invalid type", func(t *testing.T) {
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter: "dc1",
+			IdentityProvider: structs.ACLIdentityProvider{
+				Name:        "invalid",
+				Description: "invalid test",
+				Type:        "invalid",
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	for _, test := range []struct {
+		name string
+		ok   bool
+	}{
+		{"-abc", false},
+		{"abc-", false},
+		{"a-bc", true},
+		{"_abc", false},
+		{"abc_", false},
+		{"a_bc", true},
+		{":abc", false},
+		{"abc:", false},
+		{"a:bc", false},
+		{"Abc", false},
+		{"aBc", false},
+		{"abC", false},
+		{"0abc", true},
+		{"abc0", true},
+		{"a0bc", true},
+	} {
+		var testName string
+		if test.ok {
+			testName = "Create k8s with valid name (by regex): " + test.name
+		} else {
+			testName = "Create k8s with invalid name (by regex): " + test.name
+		}
+		t.Run(testName, func(t *testing.T) {
+			req := structs.ACLIdentityProviderSetRequest{
+				Datacenter:       "dc1",
+				IdentityProvider: newK8S(test.name),
+				WriteRequest:     structs.WriteRequest{Token: "root"},
+			}
+			resp := structs.ACLIdentityProvider{}
+
+			err := acl.IdentityProviderSet(&req, &resp)
+
+			if test.ok {
+				require.NoError(t, err)
+
+				// Get the idp directly to validate that it exists
+				idpResp, err := retrieveTestIDP(codec, "root", "dc1", resp.Name)
+				require.NoError(t, err)
+				idp := idpResp.IdentityProvider
+
+				require.Equal(t, idp.Name, test.name)
+				require.Equal(t, idp.Type, "kubernetes")
+				require.Equal(t, idp.KubernetesHost, "https://abc:8443")
+				require.Equal(t, idp.KubernetesCACertFile, caPath)
+				require.Equal(t, idp.KubernetesServiceAccountJWT, goodJWT_A)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+
+	t.Run("Create k8s with missing k8s host", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesHost = ""
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create k8s with missing ca cert", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesCACertFile = ""
+		reqIDP.KubernetesCACert = ""
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create k8s with bad ca cert file", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesCACertFile = caPathBad
+		reqIDP.KubernetesCACert = ""
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create k8s with bad ca cert", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesCACertFile = ""
+		reqIDP.KubernetesCACert = "garbage"
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create k8s with missing ca cert file", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesCACertFile = filepath.Join(tempDir, "missing.crt")
+		reqIDP.KubernetesCACert = ""
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create k8s with missing jwt", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesServiceAccountJWT = ""
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+
+	t.Run("Create k8s with bad jwt", func(t *testing.T) {
+		reqIDP := newK8S("k8s-2")
+		reqIDP.KubernetesServiceAccountJWT = "bad"
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: reqIDP,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLIdentityProvider{}
+
+		err := acl.IdentityProviderSet(&req, &resp)
+		require.Error(t, err)
+	})
+}
+
+func TestACLEndpoint_IdentityProviderDelete(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	ca := connect.TestCA(t, nil)
+
+	existingIDP, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	acl := ACL{srv: s1}
+
+	t.Run("normal", func(t *testing.T) {
+		req := structs.ACLIdentityProviderDeleteRequest{
+			Datacenter:           "dc1",
+			IdentityProviderName: existingIDP.Name,
+			WriteRequest:         structs.WriteRequest{Token: "root"},
+		}
+
+		var ignored bool
+		err = acl.IdentityProviderDelete(&req, &ignored)
+		require.NoError(t, err)
+
+		// Make sure the idp is gone
+		idpResp, err := retrieveTestIDP(codec, "root", "dc1", existingIDP.Name)
+		require.NoError(t, err)
+		require.Nil(t, idpResp.IdentityProvider)
+	})
+
+	t.Run("delete something that doesn't exist", func(t *testing.T) {
+		req := structs.ACLIdentityProviderDeleteRequest{
+			Datacenter:           "dc1",
+			IdentityProviderName: "missing",
+			WriteRequest:         structs.WriteRequest{Token: "root"},
+		}
+
+		var ignored bool
+		err = acl.IdentityProviderDelete(&req, &ignored)
+		require.NoError(t, err)
+	})
+}
+
+// Deleting an identity provider atomically deletes all rules as well.
+func TestACLEndpoint_IdentityProviderDelete_RuleCascade(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	ca := connect.TestCA(t, nil)
+
+	idp1, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+	i1_r1, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		idp1.Name,
+		[]string{"serviceaccount.name=abc"},
+		"abc",
+		false,
+	)
+	require.NoError(t, err)
+	i1_r2, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		idp1.Name,
+		[]string{"serviceaccount.name=def"},
+		"def",
+		false,
+	)
+	require.NoError(t, err)
+
+	idp2, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+	i2_r1, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		idp2.Name,
+		[]string{"serviceaccount.name=abc"},
+		"abc",
+		false,
+	)
+	require.NoError(t, err)
+	i2_r2, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		idp2.Name,
+		[]string{"serviceaccount.name=def"},
+		"def",
+		false,
+	)
+	require.NoError(t, err)
+
+	acl := ACL{srv: s1}
+
+	req := structs.ACLIdentityProviderDeleteRequest{
+		Datacenter:           "dc1",
+		IdentityProviderName: idp1.Name,
+		WriteRequest:         structs.WriteRequest{Token: "root"},
+	}
+
+	var ignored bool
+	err = acl.IdentityProviderDelete(&req, &ignored)
+	require.NoError(t, err)
+
+	// Make sure the idp is gone.
+	idpResp, err := retrieveTestIDP(codec, "root", "dc1", idp1.Name)
+	require.NoError(t, err)
+	require.Nil(t, idpResp.IdentityProvider)
+
+	// Make sure the rules are gone.
+	for _, id := range []string{i1_r1.ID, i1_r2.ID} {
+		ruleResp, err := retrieveTestRoleBindingRule(codec, "root", "dc1", id)
+		require.NoError(t, err)
+		require.Nil(t, ruleResp.RoleBindingRule)
+	}
+
+	// Make sure the rules for the untouched IDP are still there.
+	for _, id := range []string{i2_r1.ID, i2_r2.ID} {
+		ruleResp, err := retrieveTestRoleBindingRule(codec, "root", "dc1", id)
+		require.NoError(t, err)
+		require.NotNil(t, ruleResp.RoleBindingRule)
+	}
+}
+
+func TestACLEndpoint_IdentityProviderList(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	ca := connect.TestCA(t, nil)
+
+	i1, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	i2, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	acl := ACL{srv: s1}
+
+	req := structs.ACLIdentityProviderListRequest{
+		Datacenter:   "dc1",
+		QueryOptions: structs.QueryOptions{Token: "root"},
+	}
+
+	resp := structs.ACLIdentityProviderListResponse{}
+
+	err = acl.IdentityProviderList(&req, &resp)
+	require.NoError(t, err)
+	require.ElementsMatch(t, gatherIDs(t, resp.IdentityProviders), []string{i1.Name, i2.Name})
+}
+
+func TestACLEndpoint_RoleBindingRuleSet(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	acl := ACL{srv: s1}
+	var ruleID string
+
+	ca := connect.TestCA(t, nil)
+	testIDP, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+	otherTestIDP, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	newRule := func() structs.ACLRoleBindingRule {
+		return structs.ACLRoleBindingRule{
+			Description: "foobar",
+			IDPName:     testIDP.Name,
+			Match: []*structs.ACLRoleBindingRuleMatch{
+				&structs.ACLRoleBindingRuleMatch{
+					Selector: []string{
+						"serviceaccount.name=abc",
+					},
+				},
+			},
+			RoleName: "abc",
+		}
+	}
+
+	requireSetErrors := func(t *testing.T, reqRule structs.ACLRoleBindingRule) {
+		req := structs.ACLRoleBindingRuleSetRequest{
+			Datacenter:      "dc1",
+			RoleBindingRule: reqRule,
+			WriteRequest:    structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLRoleBindingRule{}
+
+		err := acl.RoleBindingRuleSet(&req, &resp)
+		require.Error(t, err)
+	}
+
+	requireOK := func(t *testing.T, reqRule structs.ACLRoleBindingRule) *structs.ACLRoleBindingRule {
+		req := structs.ACLRoleBindingRuleSetRequest{
+			Datacenter:      "dc1",
+			RoleBindingRule: reqRule,
+			WriteRequest:    structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLRoleBindingRule{}
+
+		err := acl.RoleBindingRuleSet(&req, &resp)
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.ID)
+		return &resp
+	}
+
+	t.Run("Create it", func(t *testing.T) {
+		reqRule := newRule()
+
+		req := structs.ACLRoleBindingRuleSetRequest{
+			Datacenter:      "dc1",
+			RoleBindingRule: reqRule,
+			WriteRequest:    structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLRoleBindingRule{}
+
+		err := acl.RoleBindingRuleSet(&req, &resp)
+		require.NoError(t, err)
+		require.NotNil(t, resp.ID)
+
+		// Get the rule directly to validate that it exists
+		ruleResp, err := retrieveTestRoleBindingRule(codec, "root", "dc1", resp.ID)
+		require.NoError(t, err)
+		rule := ruleResp.RoleBindingRule
+
+		require.NotEmpty(t, rule.ID)
+		require.Equal(t, rule.Description, "foobar")
+		require.Equal(t, rule.IDPName, testIDP.Name)
+		require.Len(t, rule.Match, 1)
+		require.Len(t, rule.Match[0].Selector, 1)
+		require.Equal(t, "serviceaccount.name=abc", rule.Match[0].Selector[0])
+		require.Equal(t, "abc", rule.RoleName)
+		require.False(t, rule.MustExist)
+
+		ruleID = rule.ID
+	})
+
+	t.Run("Update fails; cannot change idp name", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.ID = ruleID
+		reqRule.IDPName = otherTestIDP.Name
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Update it", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.ID = ruleID
+		reqRule.Description = "foobar modified"
+		reqRule.Match = []*structs.ACLRoleBindingRuleMatch{
+			&structs.ACLRoleBindingRuleMatch{
+				Selector: []string{
+					"serviceaccount.namespace=def",
+				},
+			},
+		}
+		reqRule.RoleName = "def"
+		reqRule.MustExist = true
+
+		req := structs.ACLRoleBindingRuleSetRequest{
+			Datacenter:      "dc1",
+			RoleBindingRule: reqRule,
+			WriteRequest:    structs.WriteRequest{Token: "root"},
+		}
+		resp := structs.ACLRoleBindingRule{}
+
+		err := acl.RoleBindingRuleSet(&req, &resp)
+		require.NoError(t, err)
+		require.NotNil(t, resp.ID)
+
+		// Get the rule directly to validate that it exists
+		ruleResp, err := retrieveTestRoleBindingRule(codec, "root", "dc1", resp.ID)
+		require.NoError(t, err)
+		rule := ruleResp.RoleBindingRule
+
+		require.NotEmpty(t, rule.ID)
+		require.Equal(t, rule.Description, "foobar modified")
+		require.Equal(t, rule.IDPName, testIDP.Name)
+		require.Len(t, rule.Match, 1)
+		require.Len(t, rule.Match[0].Selector, 1)
+		require.Equal(t, "serviceaccount.namespace=def", rule.Match[0].Selector[0])
+		require.Equal(t, "def", rule.RoleName)
+		require.True(t, rule.MustExist)
+	})
+
+	t.Run("Create fails; empty idp name", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.IDPName = ""
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; unknown idp name", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.IDPName = "unknown"
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create with no explicit matches", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.Match = nil
+
+		rule := requireOK(t, reqRule)
+		require.Len(t, rule.Match, 0)
+	})
+
+	t.Run("Create fails; match contains no selector", func(t *testing.T) {
+		// If you don't want any selectors you should not provide any match.
+		reqRule := newRule()
+		reqRule.Match = []*structs.ACLRoleBindingRuleMatch{
+			&structs.ACLRoleBindingRuleMatch{
+				Selector: nil,
+			},
+		}
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; match selector reuses vars", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.Match = []*structs.ACLRoleBindingRuleMatch{
+			&structs.ACLRoleBindingRuleMatch{
+				Selector: []string{
+					"serviceaccount.name=a",
+					"serviceaccount.name=b",
+				},
+			},
+		}
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; match selector with unknown vars", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.Match = []*structs.ACLRoleBindingRuleMatch{
+			&structs.ACLRoleBindingRuleMatch{
+				Selector: []string{
+					"serviceaccount.name=a",
+					"serviceaccount.bizarroname=b",
+				},
+			},
+		}
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; match selector invalid", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.Match = []*structs.ACLRoleBindingRuleMatch{
+			&structs.ACLRoleBindingRuleMatch{
+				Selector: []string{
+					"serviceaccount.name",
+				},
+			},
+		}
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; empty role name", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.RoleName = ""
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; role name with unknown vars", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.RoleName = "k8s-{{ serviceaccount.bizarroname }}"
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; invalid role name no template", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.RoleName = "-abc-"
+		requireSetErrors(t, reqRule)
+	})
+
+	t.Run("Create fails; invalid role name with template", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.RoleName = "k8s-{{ serviceaccount.name"
+		requireSetErrors(t, reqRule)
+	})
+	t.Run("Create fails; invalid role name after template computed", func(t *testing.T) {
+		reqRule := newRule()
+		reqRule.RoleName = "k8s-{{ serviceaccount.name }}-blah-"
+		requireSetErrors(t, reqRule)
+	})
+}
+
+func TestACLEndpoint_RoleBindingRuleDelete(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	ca := connect.TestCA(t, nil)
+	testIDP, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	existingRule, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		testIDP.Name,
+		[]string{"serviceaccount.name=abc"},
+		"abc",
+		false,
+	)
+	require.NoError(t, err)
+
+	acl := ACL{srv: s1}
+
+	t.Run("normal", func(t *testing.T) {
+		req := structs.ACLRoleBindingRuleDeleteRequest{
+			Datacenter:        "dc1",
+			RoleBindingRuleID: existingRule.ID,
+			WriteRequest:      structs.WriteRequest{Token: "root"},
+		}
+
+		var ignored bool
+		err = acl.RoleBindingRuleDelete(&req, &ignored)
+		require.NoError(t, err)
+
+		// Make sure the rule is gone
+		ruleResp, err := retrieveTestRoleBindingRule(codec, "root", "dc1", existingRule.ID)
+		require.NoError(t, err)
+		require.Nil(t, ruleResp.RoleBindingRule)
+	})
+
+	t.Run("delete something that doesn't exist", func(t *testing.T) {
+		fakeID, err := uuid.GenerateUUID()
+		require.NoError(t, err)
+
+		req := structs.ACLRoleBindingRuleDeleteRequest{
+			Datacenter:        "dc1",
+			RoleBindingRuleID: fakeID,
+			WriteRequest:      structs.WriteRequest{Token: "root"},
+		}
+
+		var ignored bool
+		err = acl.RoleBindingRuleDelete(&req, &ignored)
+		require.NoError(t, err)
+	})
+}
+
+func TestACLEndpoint_RoleBindingRuleList(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	ca := connect.TestCA(t, nil)
+	testIDP, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	r1, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		testIDP.Name,
+		[]string{"serviceaccount.name=abc"},
+		"abc",
+		false,
+	)
+	require.NoError(t, err)
+
+	r2, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1",
+		testIDP.Name,
+		[]string{"serviceaccount.name=def"},
+		"def",
+		false,
+	)
+	require.NoError(t, err)
+
+	acl := ACL{srv: s1}
+
+	req := structs.ACLRoleBindingRuleListRequest{
+		Datacenter:   "dc1",
+		QueryOptions: structs.QueryOptions{Token: "root"},
+	}
+
+	resp := structs.ACLRoleBindingRuleListResponse{}
+
+	err = acl.RoleBindingRuleList(&req, &resp)
+	require.NoError(t, err)
+	require.ElementsMatch(t, gatherIDs(t, resp.RoleBindingRules), []string{r1.ID, r2.ID})
+}
+
+type fakeK8SIdentityProviderValidator struct {
+	data map[string]map[string]string // token -> fieldmap
+
+	*k8sIdentityProviderValidator
+}
+
+func (p *fakeK8SIdentityProviderValidator) Reset() {
+	p.data = nil
+}
+
+func (p *fakeK8SIdentityProviderValidator) InstallToken(token string, fieldMap map[string]string) {
+	if p.data == nil {
+		p.data = make(map[string]map[string]string)
+	}
+	p.data[token] = fieldMap
+}
+
+func (p *fakeK8SIdentityProviderValidator) ValidateLogin(req *LoginValidationRequest) (*LoginValidationResponse, error) {
+	if p.data == nil {
+		return nil, acl.ErrNotFound
+	}
+	fm, ok := p.data[req.Token]
+	if !ok {
+		return nil, acl.ErrNotFound
+	}
+
+	fmCopy := make(map[string]string)
+	for k, v := range fm {
+		fmCopy[k] = v
+	}
+
+	return &LoginValidationResponse{Fields: fmCopy}, nil
+}
+
+func TestACLEndpoint_Login_LocalTokensDisabled(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+		c.ACLTokenMinExpirationTTL = 10 * time.Millisecond
+		c.ACLTokenMaxExpirationTTL = 5 * time.Second
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	dir2, s2 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.Datacenter = "dc2"
+		c.ACLTokenMinExpirationTTL = 10 * time.Millisecond
+		c.ACLTokenMaxExpirationTTL = 5 * time.Second
+		// disable local tokens
+		c.ACLTokenReplication = false
+	})
+	defer os.RemoveAll(dir2)
+	defer s2.Shutdown()
+	codec2 := rpcClient(t, s2)
+	defer codec2.Close()
+
+	s2.tokens.UpdateReplicationToken("root", tokenStore.TokenSourceConfig)
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+	testrpc.WaitForLeader(t, s2.RPC, "dc2")
+
+	// Try to join
+	joinWAN(t, s2, s1)
+
+	waitForNewACLs(t, s1)
+	waitForNewACLs(t, s2)
+
+	acl := ACL{srv: s1}
+	acl2 := ACL{srv: s2}
+	_ = acl
+
+	t.Run("unknown idp", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  "k8s",
+				IDPToken: "fake-web",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc2",
+		}
+		resp := structs.ACLToken{}
+
+		requireErrorContains(t, acl2.Login(&req, &resp), "Local tokens are disabled")
+	})
+}
+
+func TestACLEndpoint_Login(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	acl := ACL{srv: s1}
+
+	ca := connect.TestCA(t, nil)
+
+	idp, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	ruleDB, err := upsertTestRoleBindingRule(
+		codec, "root", "dc1", idp.Name,
+		[]string{
+			"serviceaccount.namespace=default",
+			"serviceaccount.name=db",
+		},
+		"k8s-{{serviceaccount.name}}",
+		false,
+	)
+	_, err = upsertTestRoleBindingRule(
+		codec, "root", "dc1", idp.Name,
+		[]string{
+			"serviceaccount.namespace=default",
+			"serviceaccount.name=monolith",
+		},
+		"k8s-{{serviceaccount.name}}",
+		true,
+	)
+	require.NoError(t, err)
+
+	// Swap out the k8s validator with our own test one.
+	validator := &fakeK8SIdentityProviderValidator{}
+	validator.InstallToken(
+		"fake-web", // no rules
+		map[string]string{
+			"serviceaccount.namespace": "default",
+			"serviceaccount.name":      "web",
+			"serviceaccount.uid":       "abc123",
+		},
+	)
+	validator.InstallToken(
+		"fake-db", // 1 rule
+		map[string]string{
+			"serviceaccount.namespace": "default",
+			"serviceaccount.name":      "db",
+			"serviceaccount.uid":       "def456",
+		},
+	)
+	validator.InstallToken(
+		"fake-monolith", // 1 rule, must exist
+		map[string]string{
+			"serviceaccount.namespace": "default",
+			"serviceaccount.name":      "monolith",
+			"serviceaccount.uid":       "ghi789",
+		},
+	)
+	s1.aclIDPValidatorCreateTestHook = func(orig IdentityProviderValidator) (IdentityProviderValidator, error) {
+		if k8s, ok := orig.(*k8sIdentityProviderValidator); ok {
+			validator.k8sIdentityProviderValidator = k8s
+			return validator, nil
+		}
+		return orig, nil
+	}
+
+	t.Run("do not provide a token", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-web",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		req.Token = "nope"
+		resp := structs.ACLToken{}
+
+		requireErrorContains(t, acl.Login(&req, &resp), "do not provide a token")
+	})
+
+	t.Run("unknown idp", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name + "-notexist",
+				IDPToken: "fake-web",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		requireErrorContains(t, acl.Login(&req, &resp), "ACL not found")
+	})
+
+	t.Run("idp is known but type doesn't match", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "not-kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-web",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		require.Error(t, acl.Login(&req, &resp))
+	})
+
+	t.Run("invalid idp token", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "invalid",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		require.Error(t, acl.Login(&req, &resp))
+	})
+
+	t.Run("valid idp token no bindings", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-web",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		requireErrorContains(t, acl.Login(&req, &resp), "Permission denied")
+	})
+
+	t.Run("valid idp token 1 binding must exist and does not exist", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-monolith",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		require.Error(t, acl.Login(&req, &resp))
+	})
+
+	// create the role so that the mustexist login works
+	var monolithRoleID string
+	{
+		arg := structs.ACLRoleSetRequest{
+			Datacenter: "dc1",
+			Role: structs.ACLRole{
+				Name: "k8s-monolith",
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		var out structs.ACLRole
+		require.NoError(t, acl.RoleSet(&arg, &out))
+
+		monolithRoleID = out.ID
+	}
+
+	t.Run("valid idp token 1 binding must exist and now exists", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-monolith",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		require.NoError(t, acl.Login(&req, &resp))
+
+		require.Equal(t, idp.Name, resp.IDPName)
+		require.Equal(t, `token created via login: {"pod":"pod1"}`, resp.Description)
+		require.True(t, resp.Local)
+		require.Len(t, resp.Roles, 1)
+		role := resp.Roles[0]
+		require.Equal(t, monolithRoleID, role.ID)
+		require.Equal(t, "k8s-monolith", role.Name)
+		require.Empty(t, role.BoundName)
+	})
+
+	t.Run("valid idp token 1 binding", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-db",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		require.NoError(t, acl.Login(&req, &resp))
+
+		require.Equal(t, idp.Name, resp.IDPName)
+		require.Equal(t, `token created via login: {"pod":"pod1"}`, resp.Description)
+		require.True(t, resp.Local)
+		require.Len(t, resp.Roles, 1)
+		role := resp.Roles[0]
+		require.Empty(t, role.ID)
+		require.Empty(t, role.Name)
+		require.Equal(t, "k8s-db", role.BoundName)
+	})
+
+	{
+		req := structs.ACLRoleBindingRuleSetRequest{
+			Datacenter: "dc1",
+			RoleBindingRule: structs.ACLRoleBindingRule{
+				IDPName:   ruleDB.IDPName,
+				RoleName:  ruleDB.RoleName,
+				MustExist: false,
+				Match:     nil,
+			},
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+
+		var out structs.ACLRoleBindingRule
+		require.NoError(t, acl.RoleBindingRuleSet(&req, &out))
+	}
+
+	t.Run("valid idp token 1 binding (no selectors this time)", func(t *testing.T) {
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-db",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		require.NoError(t, acl.Login(&req, &resp))
+
+		require.Equal(t, idp.Name, resp.IDPName)
+		require.Equal(t, `token created via login: {"pod":"pod1"}`, resp.Description)
+		require.True(t, resp.Local)
+		require.Len(t, resp.Roles, 1)
+		role := resp.Roles[0]
+		require.Empty(t, role.ID)
+		require.Empty(t, role.Name)
+		require.Equal(t, "k8s-db", role.BoundName)
+	})
+
+	{
+		// Update the k8s idp to force the cache to invalidate for the next
+		// subtest.
+		updated := *idp
+		updated.Description = "updated for the test"
+
+		req := structs.ACLIdentityProviderSetRequest{
+			Datacenter:       "dc1",
+			IdentityProvider: updated,
+			WriteRequest:     structs.WriteRequest{Token: "root"},
+		}
+
+		var ignored structs.ACLIdentityProvider
+		require.NoError(t, acl.IdentityProviderSet(&req, &ignored))
+	}
+
+	// ensure our create hook does something different this time
+	validator2 := &fakeK8SIdentityProviderValidator{}
+	s1.aclIDPValidatorCreateTestHook = func(orig IdentityProviderValidator) (IdentityProviderValidator, error) {
+		if k8s, ok := orig.(*k8sIdentityProviderValidator); ok {
+			validator2.k8sIdentityProviderValidator = k8s
+			return validator2, nil
+		}
+		return orig, nil
+	}
+
+	t.Run("updating the idp invalidates the cache", func(t *testing.T) {
+		// We'll try to login with the 'fake-db' cred which DOES exist in the
+		// old fake validator, but no longer exists in the new fake validator.
+		req := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-db",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		resp := structs.ACLToken{}
+
+		requireErrorContains(t, acl.Login(&req, &resp), "ACL not found")
+	})
+}
+
+func TestACLEndpoint_Logout(t *testing.T) {
+	t.Parallel()
+
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLsEnabled = true
+		c.ACLMasterToken = "root"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	codec := rpcClient(t, s1)
+	defer codec.Close()
+
+	testrpc.WaitForLeader(t, s1.RPC, "dc1")
+
+	acl := ACL{srv: s1}
+
+	ca := connect.TestCA(t, nil)
+
+	idp, err := upsertTestIDP(codec, "root", "dc1", ca.RootCert)
+	require.NoError(t, err)
+
+	_, err = upsertTestRoleBindingRule(
+		codec, "root", "dc1", idp.Name,
+		nil,
+		"k8s-{{serviceaccount.name}}",
+		false,
+	)
+	require.NoError(t, err)
+
+	// Swap out the k8s validator with our own test one.
+	validator := &fakeK8SIdentityProviderValidator{}
+	validator.InstallToken(
+		"fake-web", // no rules
+		map[string]string{
+			"serviceaccount.namespace": "default",
+			"serviceaccount.name":      "web",
+			"serviceaccount.uid":       "abc123",
+		},
+	)
+	s1.aclIDPValidatorCreateTestHook = func(orig IdentityProviderValidator) (IdentityProviderValidator, error) {
+		if k8s, ok := orig.(*k8sIdentityProviderValidator); ok {
+			validator.k8sIdentityProviderValidator = k8s
+			return validator, nil
+		}
+		return orig, nil
+	}
+
+	t.Run("you must provide a token", func(t *testing.T) {
+		req := structs.ACLLogoutRequest{
+			Datacenter: "dc1",
+			// WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+		req.Token = ""
+		var ignored bool
+
+		requireErrorContains(t, acl.Logout(&req, &ignored), "ACL not found")
+	})
+
+	t.Run("logout from deleted token", func(t *testing.T) {
+		req := structs.ACLLogoutRequest{
+			Datacenter:   "dc1",
+			WriteRequest: structs.WriteRequest{Token: "not-found"},
+		}
+		var ignored bool
+		requireErrorContains(t, acl.Logout(&req, &ignored), "ACL not found")
+	})
+
+	t.Run("logout from non-IDP-linked token should fail", func(t *testing.T) {
+		req := structs.ACLLogoutRequest{
+			Datacenter:   "dc1",
+			WriteRequest: structs.WriteRequest{Token: "root"},
+		}
+		var ignored bool
+		requireErrorContains(t, acl.Logout(&req, &ignored), "Permission denied")
+	})
+
+	t.Run("login then logout", func(t *testing.T) {
+		// Create a totally legit Login token.
+		loginReq := structs.ACLLoginRequest{
+			Auth: &structs.ACLLoginParams{
+				IDPType:  "kubernetes",
+				IDPName:  idp.Name,
+				IDPToken: "fake-web",
+				Meta:     map[string]string{"pod": "pod1"},
+			},
+			Datacenter: "dc1",
+		}
+		loginToken := structs.ACLToken{}
+
+		require.NoError(t, acl.Login(&loginReq, &loginToken))
+		require.NotEmpty(t, loginToken.SecretID)
+
+		// Now turn around and nuke it.
+		req := structs.ACLLogoutRequest{
+			Datacenter:   "dc1",
+			WriteRequest: structs.WriteRequest{Token: loginToken.SecretID},
+		}
+
+		var ignored bool
+		require.NoError(t, acl.Logout(&req, &ignored))
+	})
+
+	// TODO: token not found
+	// TODO: not an idp token
+	// TODO: not in acl datacenter or token is not local (FORWARD)
+}
+
+func gatherIDs(t *testing.T, v interface{}) []string {
+	t.Helper()
+
+	var out []string
+	switch x := v.(type) {
+	case []*structs.ACLRole:
+		for _, r := range x {
+			out = append(out, r.ID)
+		}
+	case structs.ACLRoleListStubs:
+		for _, r := range x {
+			out = append(out, r.ID)
+		}
+	case []*structs.ACLPolicy:
+		for _, p := range x {
+			out = append(out, p.ID)
+		}
+	case structs.ACLPolicyListStubs:
+		for _, p := range x {
+			out = append(out, p.ID)
+		}
+	case []*structs.ACLToken:
+		for _, p := range x {
+			out = append(out, p.AccessorID)
+		}
+	case structs.ACLTokenListStubs:
+		for _, p := range x {
+			out = append(out, p.AccessorID)
+		}
+	case []*structs.ACLIdentityProvider:
+		for _, p := range x {
+			out = append(out, p.Name)
+		}
+	case structs.ACLIdentityProviderListStubs:
+		for _, p := range x {
+			out = append(out, p.Name)
+		}
+	case []*structs.ACLRoleBindingRule:
+		for _, p := range x {
+			out = append(out, p.ID)
+		}
+	case structs.ACLRoleBindingRules:
+		for _, p := range x {
+			out = append(out, p.ID)
+		}
+	default:
+		t.Fatalf("unknown type: %T", x)
+	}
+	return out
 }
 
 // upsertTestToken creates a token for testing purposes
@@ -2771,6 +4435,130 @@ func retrieveTestRole(codec rpc.ClientCodec, masterToken string, datacenter stri
 	return &out, nil
 }
 
+func deleteTestIDP(codec rpc.ClientCodec, masterToken string, datacenter string, idpName string) error {
+	arg := structs.ACLIdentityProviderDeleteRequest{
+		Datacenter:           datacenter,
+		IdentityProviderName: idpName,
+		WriteRequest:         structs.WriteRequest{Token: masterToken},
+	}
+
+	var ignored string
+	err := msgpackrpc.CallWithCodec(codec, "ACL.IdentityProviderDelete", &arg, &ignored)
+	return err
+}
+
+func upsertTestIDP(codec rpc.ClientCodec, masterToken string, datacenter string, caCert string) (*structs.ACLIdentityProvider, error) {
+	name, err := uuid.GenerateUUID()
+	if err != nil {
+		return nil, err
+	}
+
+	req := structs.ACLIdentityProviderSetRequest{
+		Datacenter: datacenter,
+		IdentityProvider: structs.ACLIdentityProvider{
+			Name:                        "test-idp-" + name,
+			Type:                        "kubernetes",
+			KubernetesHost:              "https://abc:8443",
+			KubernetesCACert:            caCert,
+			KubernetesServiceAccountJWT: goodJWT_A,
+		},
+		WriteRequest: structs.WriteRequest{Token: masterToken},
+	}
+
+	var out structs.ACLIdentityProvider
+
+	err = msgpackrpc.CallWithCodec(codec, "ACL.IdentityProviderSet", &req, &out)
+	if err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func retrieveTestIDP(codec rpc.ClientCodec, masterToken string, datacenter string, name string) (*structs.ACLIdentityProviderResponse, error) {
+	arg := structs.ACLIdentityProviderGetRequest{
+		Datacenter:           datacenter,
+		IdentityProviderName: name,
+		QueryOptions:         structs.QueryOptions{Token: masterToken},
+	}
+
+	var out structs.ACLIdentityProviderResponse
+
+	err := msgpackrpc.CallWithCodec(codec, "ACL.IdentityProviderRead", &arg, &out)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func deleteTestRoleBindingRule(codec rpc.ClientCodec, masterToken string, datacenter string, ruleID string) error {
+	arg := structs.ACLRoleBindingRuleDeleteRequest{
+		Datacenter:        datacenter,
+		RoleBindingRuleID: ruleID,
+		WriteRequest:      structs.WriteRequest{Token: masterToken},
+	}
+
+	var ignored string
+	err := msgpackrpc.CallWithCodec(codec, "ACL.RoleBindingRuleDelete", &arg, &ignored)
+	return err
+}
+
+func upsertTestRoleBindingRule(
+	codec rpc.ClientCodec,
+	masterToken string,
+	datacenter string,
+	idpName string,
+	singleSelector []string,
+	roleName string,
+	mustExist bool,
+) (*structs.ACLRoleBindingRule, error) {
+	req := structs.ACLRoleBindingRuleSetRequest{
+		Datacenter: datacenter,
+		RoleBindingRule: structs.ACLRoleBindingRule{
+			IDPName:   idpName,
+			RoleName:  roleName,
+			MustExist: mustExist,
+		},
+		WriteRequest: structs.WriteRequest{Token: masterToken},
+	}
+	if len(singleSelector) > 0 {
+		req.RoleBindingRule.Match = []*structs.ACLRoleBindingRuleMatch{
+			&structs.ACLRoleBindingRuleMatch{
+				Selector: singleSelector,
+			},
+		}
+	}
+
+	var out structs.ACLRoleBindingRule
+
+	err := msgpackrpc.CallWithCodec(codec, "ACL.RoleBindingRuleSet", &req, &out)
+	if err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
+func retrieveTestRoleBindingRule(codec rpc.ClientCodec, masterToken string, datacenter string, ruleID string) (*structs.ACLRoleBindingRuleResponse, error) {
+	arg := structs.ACLRoleBindingRuleGetRequest{
+		Datacenter:        datacenter,
+		RoleBindingRuleID: ruleID,
+		QueryOptions:      structs.QueryOptions{Token: masterToken},
+	}
+
+	var out structs.ACLRoleBindingRuleResponse
+
+	err := msgpackrpc.CallWithCodec(codec, "ACL.RoleBindingRuleRead", &arg, &out)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &out, nil
+}
+
 func requireTimeEquals(t *testing.T, expect, got time.Time) {
 	t.Helper()
 	if !expect.Equal(got) {
@@ -2787,3 +4575,6 @@ func requireErrorContains(t *testing.T, err error, expectedErrorMessage string) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+const goodJWT_A = "eyJhbGciOiJSUzI1NiIsImtpZCI6IiJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJkZWZhdWx0Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9zZWNyZXQubmFtZSI6ImRlbW8tdG9rZW4ta21iOW4iLCJrdWJlcm5ldGVzLmlvL3NlcnZpY2VhY2NvdW50L3NlcnZpY2UtYWNjb3VudC5uYW1lIjoiZGVtbyIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50LnVpZCI6Ijc2MDkxYWY0LTRiNTYtMTFlOS1hYzRiLTcwOGIxMTgwMWNiZSIsInN1YiI6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDpkZWZhdWx0OmRlbW8ifQ.ZiAHjijBAOsKdum0Aix6lgtkLkGo9_Tu87dWQ5Zfwnn3r2FejEWDAnftTft1MqqnMzivZ9Wyyki5ZjQRmTAtnMPJuHC-iivqY4Wh4S6QWCJ1SivBv5tMZR79t5t8mE7R1-OHwst46spru1pps9wt9jsA04d3LpV0eeKYgdPTVaQKklxTm397kIMUugA6yINIBQ3Rh8eQqBgNwEmL4iqyYubzHLVkGkoP9MJikFI05vfRiHtYr-piXz6JFDzXMQj9rW6xtMmrBSn79ChbyvC5nz-Nj2rJPnHsb_0rDUbmXY5PpnMhBpdSH-CbZ4j8jsiib6DtaGJhVZeEQ1GjsFAZwQ"
+const goodJWT_B = "eyJhbGciOiJSUzI1NiIsImtpZCI6IiJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9uYW1lc3BhY2UiOiJkZWZhdWx0Iiwia3ViZXJuZXRlcy5pby9zZXJ2aWNlYWNjb3VudC9zZWNyZXQubmFtZSI6ImNvbnN1bC1pZHAtdG9rZW4tcmV2aWV3LWFjY291bnQtdG9rZW4tbTYyZHMiLCJrdWJlcm5ldGVzLmlvL3NlcnZpY2VhY2NvdW50L3NlcnZpY2UtYWNjb3VudC5uYW1lIjoiY29uc3VsLWlkcC10b2tlbi1yZXZpZXctYWNjb3VudCIsImt1YmVybmV0ZXMuaW8vc2VydmljZWFjY291bnQvc2VydmljZS1hY2NvdW50LnVpZCI6Ijc1ZTNjYmVhLTRiNTYtMTFlOS1hYzRiLTcwOGIxMTgwMWNiZSIsInN1YiI6InN5c3RlbTpzZXJ2aWNlYWNjb3VudDpkZWZhdWx0OmNvbnN1bC1pZHAtdG9rZW4tcmV2aWV3LWFjY291bnQifQ.uMb66tZ8d8gNzS8EnjlkzbrGKc5M-BESwS5B46IUbKfdMtajsCwgBXICytWKQ2X7wfm4QQykHVaElijBlO8QVvYeYzQE0uy75eH9EXNXmRh862YL_Qcy_doPC0R6FQXZW99S5Joc-3riKsq7N-sjEDBshOqyfDaGfan3hxaiV4Bv4hXXWRFUQ9aTAfPVvk1FQi21U9Fbml9ufk8kkk6gAmIEA_o7p-ve6WIhm48t7MJv314YhyVqXdrvmRykPdMwj4TfwSn3pTJ82P4NgSbXMJhwNkwIadJPZrM8EfN5ISpR4EW3jzP3IHtgQxrIovWQ9TQib1Z5zdRaLWaFVm6XaQ"

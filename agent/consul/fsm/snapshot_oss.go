@@ -28,6 +28,8 @@ func init() {
 	registerRestorer(structs.ACLTokenSetRequestType, restoreToken)
 	registerRestorer(structs.ACLPolicySetRequestType, restorePolicy)
 	registerRestorer(structs.ACLRoleSetRequestType, restoreRole)
+	registerRestorer(structs.ACLRoleBindingRuleSetRequestType, restoreRoleBindingRule)
+	registerRestorer(structs.ACLIdentityProviderSetRequestType, restoreIdentityProvider)
 }
 
 func persistOSS(s *snapshot, sink raft.SnapshotSink, encoder *codec.Encoder) error {
@@ -210,6 +212,34 @@ func (s *snapshot) persistACLs(sink raft.SnapshotSink,
 			return err
 		}
 		if err := encoder.Encode(role.(*structs.ACLRole)); err != nil {
+			return err
+		}
+	}
+
+	rules, err := s.state.ACLRoleBindingRules()
+	if err != nil {
+		return err
+	}
+
+	for rule := rules.Next(); rule != nil; rule = rules.Next() {
+		if _, err := sink.Write([]byte{byte(structs.ACLRoleBindingRuleSetRequestType)}); err != nil {
+			return err
+		}
+		if err := encoder.Encode(rule.(*structs.ACLRoleBindingRule)); err != nil {
+			return err
+		}
+	}
+
+	idps, err := s.state.ACLIdentityProviders()
+	if err != nil {
+		return err
+	}
+
+	for idp := idps.Next(); idp != nil; idp = rules.Next() {
+		if _, err := sink.Write([]byte{byte(structs.ACLIdentityProviderSetRequestType)}); err != nil {
+			return err
+		}
+		if err := encoder.Encode(idp.(*structs.ACLIdentityProvider)); err != nil {
 			return err
 		}
 	}
@@ -589,4 +619,20 @@ func restoreRole(header *snapshotHeader, restore *state.Restore, decoder *codec.
 		return err
 	}
 	return restore.ACLRole(&req)
+}
+
+func restoreRoleBindingRule(header *snapshotHeader, restore *state.Restore, decoder *codec.Decoder) error {
+	var req structs.ACLRoleBindingRule
+	if err := decoder.Decode(&req); err != nil {
+		return err
+	}
+	return restore.ACLRoleBindingRule(&req)
+}
+
+func restoreIdentityProvider(header *snapshotHeader, restore *state.Restore, decoder *codec.Decoder) error {
+	var req structs.ACLIdentityProvider
+	if err := decoder.Decode(&req); err != nil {
+		return err
+	}
+	return restore.ACLIdentityProvider(&req)
 }

@@ -103,6 +103,11 @@ func (c *Client) ResolveRoleFromID(roleID string) (bool, *structs.ACLRole, error
 	return false, nil, nil
 }
 
+func (c *Client) ResolveRoleFromName(roleID string) (bool, *structs.ACLRole, error) {
+	// clients do no local role resolution at the moment
+	return false, nil, nil
+}
+
 func (c *Client) ResolveToken(token string) (acl.Authorizer, error) {
 	return c.acls.ResolveToken(token)
 }

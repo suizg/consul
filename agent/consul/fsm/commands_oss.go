@@ -31,6 +31,10 @@ func init() {
 	registerCommand(structs.ConnectCALeafRequestType, (*FSM).applyConnectCALeafOperation)
 	registerCommand(structs.ACLRoleSetRequestType, (*FSM).applyACLRoleSetOperation)
 	registerCommand(structs.ACLRoleDeleteRequestType, (*FSM).applyACLRoleDeleteOperation)
+	registerCommand(structs.ACLRoleBindingRuleSetRequestType, (*FSM).applyACLRoleBindingRuleSetOperation)
+	registerCommand(structs.ACLRoleBindingRuleDeleteRequestType, (*FSM).applyACLRoleBindingRuleDeleteOperation)
+	registerCommand(structs.ACLIdentityProviderSetRequestType, (*FSM).applyACLIdentityProviderSetOperation)
+	registerCommand(structs.ACLIdentityProviderDeleteRequestType, (*FSM).applyACLIdentityProviderDeleteOperation)
 }
 
 func (c *FSM) applyRegister(buf []byte, index uint64) interface{} {
@@ -452,4 +456,48 @@ func (c *FSM) applyACLRoleDeleteOperation(buf []byte, index uint64) interface{} 
 		[]metrics.Label{{Name: "op", Value: "delete"}})
 
 	return c.state.ACLRoleBatchDelete(index, req.RoleIDs)
+}
+
+func (c *FSM) applyACLRoleBindingRuleSetOperation(buf []byte, index uint64) interface{} {
+	var req structs.ACLRoleBindingRuleBatchSetRequest
+	if err := structs.Decode(buf, &req); err != nil {
+		panic(fmt.Errorf("failed to decode request: %v", err))
+	}
+	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "rolebindingrule"}, time.Now(),
+		[]metrics.Label{{Name: "op", Value: "upsert"}})
+
+	return c.state.ACLRoleBindingRuleBatchSet(index, req.RoleBindingRules)
+}
+
+func (c *FSM) applyACLRoleBindingRuleDeleteOperation(buf []byte, index uint64) interface{} {
+	var req structs.ACLRoleBindingRuleBatchDeleteRequest
+	if err := structs.Decode(buf, &req); err != nil {
+		panic(fmt.Errorf("failed to decode request: %v", err))
+	}
+	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "rolebindingrule"}, time.Now(),
+		[]metrics.Label{{Name: "op", Value: "delete"}})
+
+	return c.state.ACLRoleBindingRuleBatchDelete(index, req.RoleBindingRuleIDs)
+}
+
+func (c *FSM) applyACLIdentityProviderSetOperation(buf []byte, index uint64) interface{} {
+	var req structs.ACLIdentityProviderBatchSetRequest
+	if err := structs.Decode(buf, &req); err != nil {
+		panic(fmt.Errorf("failed to decode request: %v", err))
+	}
+	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "identityprovider"}, time.Now(),
+		[]metrics.Label{{Name: "op", Value: "upsert"}})
+
+	return c.state.ACLIdentityProviderBatchSet(index, req.IdentityProviders)
+}
+
+func (c *FSM) applyACLIdentityProviderDeleteOperation(buf []byte, index uint64) interface{} {
+	var req structs.ACLIdentityProviderBatchDeleteRequest
+	if err := structs.Decode(buf, &req); err != nil {
+		panic(fmt.Errorf("failed to decode request: %v", err))
+	}
+	defer metrics.MeasureSinceWithLabels([]string{"fsm", "acl", "identityprovider"}, time.Now(),
+		[]metrics.Label{{Name: "op", Value: "delete"}})
+
+	return c.state.ACLIdentityProviderBatchDelete(index, req.IdentityProviderNames)
 }

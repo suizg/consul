@@ -112,9 +112,32 @@ func TestStructs_ACLCaches(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, cache)
 
-		cache.PutRole("foo", &ACLRole{})
-		entry := cache.GetRole("foo")
+		cache.PutRole("foo", "bar", &ACLRole{ID: "foo", Name: "bar"})
+
+		entry := cache.GetRoleByID("foo")
 		require.NotNil(t, entry)
 		require.NotNil(t, entry.Role)
+
+		entry = cache.GetRoleByName("bar")
+		require.NotNil(t, entry)
+		require.NotNil(t, entry.Role)
+	})
+
+	t.Run("Roles won't cache synthetics", func(t *testing.T) {
+		t.Parallel()
+		// 1 isn't valid due to a bug in golang-lru library
+		config := ACLCachesConfig{Roles: 4}
+
+		cache, err := NewACLCaches(&config)
+		require.NoError(t, err)
+		require.NotNil(t, cache)
+
+		cache.PutRole("foo", "bar", &ACLRole{Name: "bar"})
+
+		entry := cache.GetRoleByID("foo")
+		require.Nil(t, entry)
+
+		entry = cache.GetRoleByName("bar")
+		require.Nil(t, entry)
 	})
 }

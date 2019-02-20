@@ -30,6 +30,10 @@ const (
 	// the HTTP token.
 	HTTPTokenEnvName = "CONSUL_HTTP_TOKEN"
 
+	// HTTPTokenFileEnvName defines an environment variable name which sets
+	// the HTTP token file.
+	HTTPTokenFileEnvName = "CONSUL_HTTP_TOKEN_FILE"
+
 	// HTTPAuthEnvName defines an environment variable name which sets
 	// the HTTP authentication header.
 	HTTPAuthEnvName = "CONSUL_HTTP_AUTH"
@@ -276,6 +280,10 @@ type Config struct {
 	// which overrides the agent's default token.
 	Token string
 
+	// TokenFile is a file containing the current token to use for this client.
+	// If provided it is read once at startup and never again.
+	TokenFile string
+
 	TLSConfig TLSConfig
 }
 
@@ -337,6 +345,10 @@ func defaultConfig(transportFn func() *http.Transport) *Config {
 
 	if addr := os.Getenv(HTTPAddrEnvName); addr != "" {
 		config.Address = addr
+	}
+
+	if tokenFile := os.Getenv(HTTPTokenFileEnvName); tokenFile != "" {
+		config.TokenFile = tokenFile
 	}
 
 	if token := os.Getenv(HTTPTokenEnvName); token != "" {
@@ -445,6 +457,7 @@ func (c *Config) GenerateEnv() []string {
 	env = append(env,
 		fmt.Sprintf("%s=%s", HTTPAddrEnvName, c.Address),
 		fmt.Sprintf("%s=%s", HTTPTokenEnvName, c.Token),
+		fmt.Sprintf("%s=%s", HTTPTokenFileEnvName, c.TokenFile),
 		fmt.Sprintf("%s=%t", HTTPSSLEnvName, c.Scheme == "https"),
 		fmt.Sprintf("%s=%s", HTTPCAFile, c.TLSConfig.CAFile),
 		fmt.Sprintf("%s=%s", HTTPCAPath, c.TLSConfig.CAPath),
@@ -537,6 +550,19 @@ func NewClient(config *Config) (*Client, error) {
 		config.Address = parts[1]
 	}
 
+	// If the TokenFile is set, always use that, even if a Token is configured.
+	// This is because when TokenFile is set it is read into the Token field.
+	// We want any derived clients to have to re-read the token file.
+	if config.TokenFile != "" {
+		data, err := ioutil.ReadFile(config.TokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("Error loading token file: %s", err)
+		}
+
+		if token := strings.TrimSpace(string(data)); token != "" {
+			config.Token = token
+		}
+	}
 	if config.Token == "" {
 		config.Token = defConfig.Token
 	}

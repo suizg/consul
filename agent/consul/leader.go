@@ -414,6 +414,10 @@ func (s *Server) initializeACLs(upgrade bool) error {
 	// leader.
 	s.acls.cache.Purge()
 
+	// Purge the identity provider validators since they could've changed while
+	// we were not leader.
+	s.purgeIdentityProviderValidators()
+
 	// Remove any token affected by CVE-2019-8336
 	if !s.InACLDatacenter() {
 		_, token, err := s.fsm.State().ACLTokenGetBySecret(nil, redactedToken)

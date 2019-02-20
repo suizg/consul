@@ -130,6 +130,7 @@ type ACLIdentity interface {
 	SecretToken() string
 	PolicyIDs() []string
 	RoleIDs() []string
+	BoundRoleNames() []string
 	EmbeddedPolicy() *ACLPolicy
 	ServiceIdentityList() []*ACLServiceIdentity
 	IsExpired(asOf time.Time) bool
@@ -140,9 +141,16 @@ type ACLTokenPolicyLink struct {
 	Name string `hash:"ignore"`
 }
 
+// ACLTokenRoleLink is a way to link a Role to a Token. At the storage layer
+// one of ID or BoundName is required. BoundName can only be set during a Login
+// operation when RoleBindingRules are evaluated. If the optional Name is
+// presented during link creation it is resolved to an ID and persisted
+// alongside a snapshot of the current Role's name, but the Name should not be
+// considered a long-term link to the Role, as the ID is used for that.
 type ACLTokenRoleLink struct {
-	ID   string
-	Name string `hash:"ignore"`
+	ID        string `json:",omitempty"`
+	Name      string `json:",omitempty" hash:"ignore"`
+	BoundName string `json:",omitempty"`
 }
 
 // ACLServiceIdentity represents a high-level grant of all necessary privileges
@@ -186,9 +194,13 @@ func (s *ACLServiceIdentity) SyntheticPolicy() *ACLPolicy {
 	rules := fmt.Sprintf(aclPolicyTemplateServiceIdentity, s.ServiceName, s.ServiceName)
 
 	hasher := fnv.New128a()
+	hashID := fmt.Sprintf("%x", hasher.Sum([]byte(rules)))
+
 	policy := &ACLPolicy{}
-	policy.ID = fmt.Sprintf("%x", hasher.Sum([]byte(rules)))
-	policy.Name = fmt.Sprintf("synthetic-policy-%s", policy.ID)
+	// TODO(rb): should we include an ID here?
+	// policy.ID = hashID
+	policy.Name = fmt.Sprintf("synthetic-policy-%s", hashID)
+	policy.Description = "synthetic policy"
 	policy.Rules = rules
 	policy.Syntax = acl.SyntaxCurrent
 	policy.Datacenters = s.Datacenters
@@ -233,6 +245,11 @@ type ACLToken struct {
 	// Whether this token is DC local. This means that it will not be synced
 	// to the ACL datacenter and replicated to others.
 	Local bool
+
+	// IDPName is the name of the identity provider used to create this token.
+	//
+	// example: "kube-eu-1"
+	IDPName string `json:",omitempty"`
 
 	// ExpirationTime represents the point after which a token should be
 	// considered revoked and is eligible for destruction. The zero value
@@ -307,9 +324,21 @@ func (t *ACLToken) PolicyIDs() []string {
 func (t *ACLToken) RoleIDs() []string {
 	var ids []string
 	for _, link := range t.Roles {
-		ids = append(ids, link.ID)
+		if link.ID != "" {
+			ids = append(ids, link.ID)
+		}
 	}
 	return ids
+}
+
+func (t *ACLToken) BoundRoleNames() []string {
+	var names []string
+	for _, link := range t.Roles {
+		if link.BoundName != "" {
+			names = append(names, link.BoundName)
+		}
+	}
+	return names
 }
 
 func (t *ACLToken) ServiceIdentityList() []*ACLServiceIdentity {
@@ -337,7 +366,8 @@ func (t *ACLToken) UsesNonLegacyFields() bool {
 		len(t.Roles) > 0 ||
 		t.Type == "" ||
 		!t.ExpirationTime.IsZero() ||
-		t.ExpirationTTL != 0
+		t.ExpirationTTL != 0 ||
+		t.IDPName != ""
 }
 
 func (t *ACLToken) EmbeddedPolicy() *ACLPolicy {
@@ -402,7 +432,11 @@ func (t *ACLToken) SetHash(force bool) []byte {
 		}
 
 		for _, link := range t.Roles {
-			hash.Write([]byte(link.ID))
+			if link.BoundName != "" {
+				hash.Write([]byte(link.BoundName))
+			} else {
+				hash.Write([]byte(link.ID))
+			}
 		}
 
 		for _, srvid := range t.ServiceIdentities {
@@ -420,7 +454,7 @@ func (t *ACLToken) SetHash(force bool) []byte {
 
 func (t *ACLToken) EstimateSize() int {
 	// 41 = 16 (RaftIndex) + 8 (Hash) + 8 (ExpirationTime) + 8 (CreateTime) + 1 (Local)
-	size := 41 + len(t.AccessorID) + len(t.SecretID) + len(t.Description) + len(t.Type) + len(t.Rules)
+	size := 41 + len(t.AccessorID) + len(t.SecretID) + len(t.Description) + len(t.Type) + len(t.Rules) + len(t.IDPName)
 	for _, link := range t.Policies {
 		size += len(link.ID) + len(link.Name)
 	}
@@ -443,6 +477,7 @@ type ACLTokenListStub struct {
 	Roles             []ACLTokenRoleLink    `json:",omitempty"`
 	ServiceIdentities []*ACLServiceIdentity `json:",omitempty"`
 	Local             bool
+	IDPName           string    `json:",omitempty"`
 	ExpirationTime    time.Time `json:",omitempty"`
 	CreateTime        time.Time `json:",omitempty"`
 	Hash              []byte
@@ -461,6 +496,7 @@ func (token *ACLToken) Stub() *ACLTokenListStub {
 		Roles:             token.Roles,
 		ServiceIdentities: token.ServiceIdentities,
 		Local:             token.Local,
+		IDPName:           token.IDPName,
 		ExpirationTime:    token.ExpirationTime,
 		CreateTime:        token.CreateTime,
 		Hash:              token.Hash,
@@ -842,6 +878,186 @@ func (r *ACLRole) EstimateSize() int {
 	return size
 }
 
+type ACLRoleBindingRule struct {
+	// ID is the internal UUID associated with the role binding rule
+	ID string
+
+	// Description is a human readable description (Optional)
+	Description string
+
+	// IDPName is the configured name of the identity provider. The rule only
+	// applies when credentials from this provider are exchanged.
+	IDPName string
+
+	// Match is a list of matching rules. Elements logically are used as a
+	// disjunction (OR) when matching identities presented.
+	Match []*ACLRoleBindingRuleMatch
+
+	// RoleName is the named ACL Role to bind to. Can be lightly templated
+	// using {{ foo }} syntax from available field names.
+	RoleName string
+
+	// MustExist controls if 'synthetic roles' are allowed. The default is
+	// that this is false and synthetic roles are allowed.
+	//
+	// When attempting to bind this role to a token during login, if a Role
+	// with the bound name exists in the database then that Role is used as-is
+	// (by name). This lets operators explicitly customize the ACLs as they may
+	// already enjoy doing.
+	//
+	// If it does not exist and MustExist=true, the Match is discarded and
+	// access is not granted.
+	//
+	// If it does not exist and MustExist=false, a Role is synthesized on the
+	// fly as if it were defined as:
+	//
+	// &ACLRole{
+	// 	Name         : "<computed RoleName>",
+	// 	Description  : "Synthetic Role for: <computed RoleName>",
+	// 	ServiceIdentities: []*ACLServiceIdentity{
+	// 		&ACLServiceIdentity{
+	// 			ServiceName: "<computed RoleName>",
+	// 		},
+	// 	},
+	// }
+	MustExist bool `json:",omitempty"`
+
+	// Embedded Raft Metadata
+	RaftIndex `hash:"ignore"`
+}
+
+func (r *ACLRoleBindingRule) Clone() *ACLRoleBindingRule {
+	r2 := *r
+	r2.Match = nil
+
+	if len(r.Match) > 0 {
+		r2.Match = make([]*ACLRoleBindingRuleMatch, len(r.Match))
+		for i, v := range r.Match {
+			r2.Match[i] = v.Clone()
+		}
+	}
+
+	return &r2
+}
+
+type ACLRoleBindingRules []*ACLRoleBindingRule
+
+func (rules ACLRoleBindingRules) Sort() {
+	sort.Slice(rules, func(i, j int) bool {
+		return rules[i].ID < rules[j].ID
+	})
+}
+
+type ACLRoleBindingRuleMatch struct {
+	// Selector is a list of field selectors. Elements logically are used as a
+	// conjunction (AND) when matching identities presented.
+	Selector []string
+}
+
+func (m *ACLRoleBindingRuleMatch) Clone() *ACLRoleBindingRuleMatch {
+	m2 := *m
+	m2.Selector = cloneStringSlice(m.Selector)
+	return &m2
+}
+
+type ACLIdentityProviderListStub struct {
+	Name           string
+	Description    string
+	Type           string
+	KubernetesHost string `json:",omitempty"`
+}
+
+func (p *ACLIdentityProvider) Stub() *ACLIdentityProviderListStub {
+	return &ACLIdentityProviderListStub{
+		Name:           p.Name,
+		Description:    p.Description,
+		Type:           p.Type,
+		KubernetesHost: p.KubernetesHost,
+	}
+}
+
+type ACLIdentityProviders []*ACLIdentityProvider
+type ACLIdentityProviderListStubs []*ACLIdentityProviderListStub
+
+func (idps ACLIdentityProviders) Sort() {
+	sort.Slice(idps, func(i, j int) bool {
+		return idps[i].Name < idps[j].Name
+	})
+}
+
+func (idps ACLIdentityProviderListStubs) Sort() {
+	sort.Slice(idps, func(i, j int) bool {
+		return idps[i].Name < idps[j].Name
+	})
+}
+
+type ACLIdentityProvider struct {
+	// Name is a unique identifier for this specific IdP. It is used later when
+	// scoping Role Binding Rules.
+	//
+	// Immutable once set and only settable during create.
+	Name string
+
+	// Description is just an optional bunch of explanatory text.
+	Description string
+
+	// Type is the type of the IdP backend this is. Available
+	// types will be "kubernetes".
+	//
+	// Immutable once set and only settable during create.
+	Type string
+
+	// KubernetesHost must be a host string, a host:port pair, or a URL to the
+	// base of the Kubernetes API server.
+	//
+	// Only relevant for Type=kubernetes.
+	KubernetesHost string `json:",omitempty"`
+
+	// PEM encoded CA cert file for use by the TLS client used to talk with the
+	// Kubernetes API.
+	//
+	// Only relevant for Type=kubernetes.
+	KubernetesCACertFile string `json:",omitempty"`
+
+	// PEM encoded CA cert for use by the TLS client used to talk with the
+	// Kubernetes API.
+	//
+	// Only relevant for Type=kubernetes.
+	KubernetesCACert string `json:",omitempty"`
+
+	// A service account JWT used to access the TokenReview API to validate
+	// other JWTs during login.
+	//
+	// Only relevant for Type=kubernetes.
+	KubernetesServiceAccountJWT string `json:",omitempty"`
+
+	// Optional list of PEM-formatted public keys or certificates (as files) used to
+	// verify the signatures of Kubernetes service account JWTs. If a
+	// certificate is given, its public key will be extracted. Not every
+	// installation of Kubernetes exposes these keys.
+	//
+	// Only relevant for Type=kubernetes.
+	KubernetesPEMKeyFiles []string `json:",omitempty"`
+
+	// Optional list of PEM-formatted public keys or certificates used to
+	// verify the signatures of Kubernetes service account JWTs. If a
+	// certificate is given, its public key will be extracted. Not every
+	// installation of Kubernetes exposes these keys.
+	//
+	// Only relevant for Type=kubernetes.
+	KubernetesPEMKeys []string `json:",omitempty"`
+
+	// Embedded Raft Metadata
+	RaftIndex `hash:"ignore"`
+}
+
+func (p *ACLIdentityProvider) Clone() *ACLIdentityProvider {
+	p2 := *p
+	p2.KubernetesPEMKeyFiles = cloneStringSlice(p.KubernetesPEMKeyFiles)
+	p2.KubernetesPEMKeys = cloneStringSlice(p.KubernetesPEMKeys)
+	return &p2
+}
+
 type ACLReplicationType string
 
 const (
@@ -921,6 +1137,7 @@ type ACLTokenListRequest struct {
 	IncludeGlobal bool   // Whether global tokens should be included
 	Policy        string // Policy filter
 	Role          string // Role filter
+	IDPName       string // Identity Provider filter
 	Datacenter    string // The datacenter to perform the request within
 	QueryOptions
 }
@@ -1091,7 +1308,7 @@ func cloneStringSlice(s []string) []string {
 
 // ACLRoleSetRequest is used at the RPC layer for creation and update requests
 type ACLRoleSetRequest struct {
-	Role       ACLRole // The policy to upsert
+	Role       ACLRole // The role to upsert
 	Datacenter string  // The datacenter to perform the request within
 	WriteRequest
 }
@@ -1143,6 +1360,7 @@ type ACLRoleListResponse struct {
 // the roles associated with the token used for retrieval
 type ACLRoleBatchGetRequest struct {
 	RoleIDs    []string // List of role ids to fetch
+	RoleNames  []string // List of role names to fetch
 	Datacenter string   // The datacenter to perform the request within
 	QueryOptions
 }
@@ -1176,4 +1394,201 @@ type ACLRoleBatchSetRequest struct {
 // This is particularly useful during replication
 type ACLRoleBatchDeleteRequest struct {
 	RoleIDs []string
+}
+
+// ACLRoleBindingRuleSetRequest is used at the RPC layer for creation and update requests
+type ACLRoleBindingRuleSetRequest struct {
+	RoleBindingRule ACLRoleBindingRule // The rule to upsert
+	Datacenter      string             // The datacenter to perform the request within
+	WriteRequest
+}
+
+func (r *ACLRoleBindingRuleSetRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLRoleBindingRuleDeleteRequest is used at the RPC layer deletion requests
+type ACLRoleBindingRuleDeleteRequest struct {
+	RoleBindingRuleID string // id of the rule to delete
+	Datacenter        string // The datacenter to perform the request within
+	WriteRequest
+}
+
+func (r *ACLRoleBindingRuleDeleteRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLRoleBindingRuleGetRequest is used at the RPC layer to perform rule read operations
+type ACLRoleBindingRuleGetRequest struct {
+	RoleBindingRuleID string // id used for the rule lookup
+	Datacenter        string // The datacenter to perform the request within
+	QueryOptions
+}
+
+func (r *ACLRoleBindingRuleGetRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLRoleBindingRuleListRequest is used at the RPC layer to request a listing of rules
+type ACLRoleBindingRuleListRequest struct {
+	IDPName    string // optional filter
+	Datacenter string // The datacenter to perform the request within
+	QueryOptions
+}
+
+func (r *ACLRoleBindingRuleListRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+type ACLRoleBindingRuleListResponse struct {
+	RoleBindingRules ACLRoleBindingRules
+	QueryMeta
+}
+
+// ACLRoleBindingRuleBatchGetRequest is used at the RPC layer to request a subset of
+// the rules associated with the token used for retrieval
+type ACLRoleBindingRuleBatchGetRequest struct {
+	RoleBindingRuleIDs []string // List of rule ids to fetch
+	Datacenter         string   // The datacenter to perform the request within
+	QueryOptions
+}
+
+func (r *ACLRoleBindingRuleBatchGetRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLRoleBindingRuleResponse returns a single binding + metadata
+type ACLRoleBindingRuleResponse struct {
+	RoleBindingRule *ACLRoleBindingRule
+	QueryMeta
+}
+
+type ACLRoleBindingRuleBatchResponse struct {
+	RoleBindingRules []*ACLRoleBindingRule
+	QueryMeta
+}
+
+// ACLRoleBindingRuleBatchSetRequest is used at the Raft layer for batching
+// multiple rule creations and updates
+type ACLRoleBindingRuleBatchSetRequest struct {
+	RoleBindingRules ACLRoleBindingRules
+}
+
+// ACLRoleBindingRuleBatchDeleteRequest is used at the Raft layer for batching
+// multiple rule deletions
+type ACLRoleBindingRuleBatchDeleteRequest struct {
+	RoleBindingRuleIDs []string
+}
+
+// ACLIdentityProviderSetRequest is used at the RPC layer for creation and update requests
+type ACLIdentityProviderSetRequest struct {
+	IdentityProvider ACLIdentityProvider // The idp to upsert
+	Datacenter       string              // The datacenter to perform the request within
+	WriteRequest
+}
+
+func (r *ACLIdentityProviderSetRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLIdentityProviderDeleteRequest is used at the RPC layer deletion requests
+type ACLIdentityProviderDeleteRequest struct {
+	IdentityProviderName string // name of the idp to delete
+	Datacenter           string // The datacenter to perform the request within
+	WriteRequest
+}
+
+func (r *ACLIdentityProviderDeleteRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLIdentityProviderGetRequest is used at the RPC layer to perform rule read operations
+type ACLIdentityProviderGetRequest struct {
+	IdentityProviderName string // name used for the idp lookup
+	Datacenter           string // The datacenter to perform the request within
+	QueryOptions
+}
+
+func (r *ACLIdentityProviderGetRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLIdentityProviderListRequest is used at the RPC layer to request a listing of idps
+type ACLIdentityProviderListRequest struct {
+	Datacenter string // The datacenter to perform the request within
+	QueryOptions
+}
+
+func (r *ACLIdentityProviderListRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+type ACLIdentityProviderListResponse struct {
+	IdentityProviders ACLIdentityProviderListStubs
+	QueryMeta
+}
+
+// ACLIdentityProviderBatchGetRequest is used at the RPC layer to request a subset of
+// the idps associated with the token used for retrieval
+// TODO: remove?
+type ACLIdentityProviderBatchGetRequest struct {
+	IdentityProviderNames []string // List of idp names to fetch
+	Datacenter            string   // The datacenter to perform the request within
+	QueryOptions
+}
+
+func (r *ACLIdentityProviderBatchGetRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+// ACLIdentityProviderResponse returns a single idp + metadata
+type ACLIdentityProviderResponse struct {
+	IdentityProvider *ACLIdentityProvider
+	QueryMeta
+}
+
+type ACLIdentityProviderBatchResponse struct {
+	IdentityProviders []*ACLIdentityProvider
+	QueryMeta
+}
+
+// ACLIdentityProviderBatchSetRequest is used at the Raft layer for batching
+// multiple idp creations and updates
+type ACLIdentityProviderBatchSetRequest struct {
+	IdentityProviders ACLIdentityProviders
+}
+
+// ACLIdentityProviderBatchDeleteRequest is used at the Raft layer for batching
+// multiple idp deletions
+type ACLIdentityProviderBatchDeleteRequest struct {
+	IdentityProviderNames []string
+}
+
+type ACLLoginParams struct {
+	// IDPType is the type of the IdP being logged into.
+	IDPType string
+	// IDPName is the name of the IdP being logged into.
+	IDPName string
+	// IDPToken is the bearer token for the given IdP.
+	IDPToken string
+	Meta     map[string]string `json:",omitempty"`
+}
+
+type ACLLoginRequest struct {
+	Auth       *ACLLoginParams
+	Datacenter string // The datacenter to perform the request within
+	WriteRequest
+}
+
+func (r *ACLLoginRequest) RequestDatacenter() string {
+	return r.Datacenter
+}
+
+type ACLLogoutRequest struct {
+	Datacenter string // The datacenter to perform the request within
+	WriteRequest
+}
+
+func (r *ACLLogoutRequest) RequestDatacenter() string {
+	return r.Datacenter
 }
