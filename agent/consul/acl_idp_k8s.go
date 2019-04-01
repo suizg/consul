@@ -119,7 +119,7 @@ func (v *k8sIdentityProviderValidator) ValidateLogin(req *LoginValidationRequest
 	if sa.EffectiveNamespace() != r.Namespace {
 		return nil, fmt.Errorf("JWT namepaces did not match")
 	}
-	if sa.EffectiveName() != r.Name {
+	if sa.EffectiveName() != r.OriginalName {
 		return nil, fmt.Errorf("JWT names did not match")
 	}
 	if sa.EffectiveUID() != r.UID {
@@ -129,7 +129,7 @@ func (v *k8sIdentityProviderValidator) ValidateLogin(req *LoginValidationRequest
 	return &LoginValidationResponse{
 		Fields: map[string]string{
 			"serviceaccount.namespace": r.Namespace,
-			"serviceaccount.name":      r.Name,
+			"serviceaccount.name":      r.Name, // return the one that could be overridden
 			"serviceaccount.uid":       r.UID,
 		},
 	}, nil

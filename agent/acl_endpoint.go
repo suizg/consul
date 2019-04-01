@@ -778,7 +778,8 @@ func (s *HTTPServer) ACLRoleBindingRuleRead(resp http.ResponseWriter, req *http.
 	}
 
 	if out.RoleBindingRule == nil {
-		return nil, acl.ErrNotFound
+		resp.WriteHeader(http.StatusNotFound)
+		return nil, nil
 	}
 
 	return out.RoleBindingRule, nil
@@ -823,8 +824,8 @@ func (s *HTTPServer) ACLRoleBindingRuleDelete(resp http.ResponseWriter, req *htt
 	}
 	s.parseToken(req, &args.Token)
 
-	var out string
-	if err := s.agent.RPC("ACL.RoleBindingRuleDelete", args, &out); err != nil {
+	var ignored bool
+	if err := s.agent.RPC("ACL.RoleBindingRuleDelete", args, &ignored); err != nil {
 		return nil, err
 	}
 
@@ -908,7 +909,8 @@ func (s *HTTPServer) ACLIdentityProviderRead(resp http.ResponseWriter, req *http
 	}
 
 	if out.IdentityProvider == nil {
-		return nil, acl.ErrNotFound
+		resp.WriteHeader(http.StatusNotFound)
+		return nil, nil
 	}
 
 	return out.IdentityProvider, nil
@@ -932,7 +934,6 @@ func (s *HTTPServer) ACLIdentityProviderWrite(resp http.ResponseWriter, req *htt
 		return nil, BadRequestError{Reason: fmt.Sprintf("IdentityProvider decoding failed: %v", err)}
 	}
 
-	// TODO: should we introduce ids again?
 	if idpName != "" {
 		if args.IdentityProvider.Name != "" && args.IdentityProvider.Name != idpName {
 			return nil, BadRequestError{Reason: "IdentityProvider Name in URL and payload do not match"}
@@ -956,8 +957,8 @@ func (s *HTTPServer) ACLIdentityProviderDelete(resp http.ResponseWriter, req *ht
 	}
 	s.parseToken(req, &args.Token)
 
-	var out string
-	if err := s.agent.RPC("ACL.IdentityProviderDelete", args, &out); err != nil {
+	var ignored bool
+	if err := s.agent.RPC("ACL.IdentityProviderDelete", args, &ignored); err != nil {
 		return nil, err
 	}
 

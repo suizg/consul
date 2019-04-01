@@ -11,8 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	"github.com/briankassouf/jose/crypto"
@@ -24,6 +25,7 @@ import (
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/mitchellh/mapstructure"
 	authv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,6 +37,8 @@ const (
 	expectedJWTIssuer = "kubernetes/serviceaccount"
 
 	uidJWTClaimKey = "kubernetes.io/serviceaccount/service-account.uid"
+
+	serviceAccountServiceNameAnnotation = "consul.hashicorp.com/service-name"
 )
 
 // errMismatchedSigningMethod is used if the certificate doesn't match the
@@ -81,9 +85,6 @@ func ParseAndValidateJWT(
 	if err != nil {
 		return nil, err
 	}
-
-	// TODO(rb): remove
-	log.Printf("[JWT CLAIMS] %s", jsonDebug(parsedJWT.Claims()))
 
 	sa := &ServiceAccount{}
 
@@ -191,9 +192,10 @@ func ParseAndValidateJWT(
 
 // This is the result from the token review
 type TokenReviewResult struct {
-	Namespace string
-	Name      string
-	UID       string
+	Namespace    string
+	Name         string
+	UID          string
+	OriginalName string
 }
 
 // This exists so we can use a mock TokenReview when running tests
@@ -228,6 +230,86 @@ func NewTokenReviewer(idp *structs.ACLIdentityProvider) (*TokenReviewAPI, error)
 	}
 
 	return t, nil
+}
+
+func (t *TokenReviewAPI) readServiceAccount(namespace, name, uid string) (*corev1.ServiceAccount, error) {
+	url := t.idp.KubernetesHost + "/" + path.Join(
+		"api/v1/namespaces",
+		url.QueryEscape(namespace),
+		"serviceaccounts",
+		url.QueryEscape(name),
+	)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// GET /api/v1/namespaces/{namespace}/serviceaccounts/{name}
+
+	bearer := "Bearer " + t.idp.KubernetesServiceAccountJWT
+	bearer = strings.TrimSpace(bearer)
+
+	// Set the JWT as the Bearer token
+	req.Header.Set("Authorization", bearer)
+
+	// Set the MIME type headers
+	// req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error reading service account: %v", err)
+	}
+
+	sa, err := parseGetServiceAccountResponse(resp)
+	switch {
+	case kubeerrors.IsUnauthorized(err):
+		// TODO: possible?
+		// If the err is unauthorized that means the token has since been deleted
+		return nil, ErrKubeUnauthorized
+	case err != nil:
+		return nil, err
+	}
+
+	return sa, nil
+}
+
+func parseGetServiceAccountResponse(resp *http.Response) (*corev1.ServiceAccount, error) {
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the request was not a success create a kubernetes error
+	if resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent {
+		// UGH the `kubeerrors` package has a nil-not-nil producing function in it. great
+		return nil, kubeerrors.NewGenericServerResponse(
+			resp.StatusCode,                 // code int
+			"GET",                           // verb string
+			schema.GroupResource{},          // qualifiedResource schema.GroupResource
+			"",                              // name string
+			strings.TrimSpace(string(body)), // serverMessage string
+			0,                               // retryAfterSeconds int
+			true,                            // isUnexpectedResponse bool
+		)
+	}
+
+	// // If we can successfully Unmarshal into a status object that means there is
+	// // an error to return
+	// var errStatus metav1.Status
+	// err = json.Unmarshal(body, &errStatus)
+	// if err == nil && errStatus.Status != metav1.StatusSuccess {
+	// 	return nil, kubeerrors.FromObject(runtime.Object(&errStatus))
+	// }
+
+	var saResp corev1.ServiceAccount
+	if err := json.Unmarshal(body, &saResp); err != nil {
+		return nil, err
+	}
+
+	return &saResp, nil
 }
 
 var (
@@ -265,7 +347,7 @@ func (t *TokenReviewAPI) Review(jwt string) (*TokenReviewResult, error) {
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error reviewing token: %v", err)
 	}
 
 	// Parse the resp into a tokenreview object or a kubernetes error type
@@ -286,9 +368,6 @@ func (t *TokenReviewAPI) Review(jwt string) (*TokenReviewResult, error) {
 		return nil, errors.New("lookup failed: service account jwt not valid")
 	}
 
-	// TODO(rb): remove debug
-	log.Printf("[USER-INFO] %s", jsonDebug(r.Status.User))
-
 	// The username is of format: system:serviceaccount:(NAMESPACE):(SERVICEACCOUNT)
 	parts := strings.Split(r.Status.User.Username, ":")
 	if len(parts) != 4 {
@@ -300,11 +379,26 @@ func (t *TokenReviewAPI) Review(jwt string) (*TokenReviewResult, error) {
 		return nil, errors.New("lookup failed: username returned is not a service account")
 	}
 
-	return &TokenReviewResult{
+	tr := &TokenReviewResult{
 		Namespace: parts[2],
 		Name:      parts[3],
 		UID:       string(r.Status.User.UID),
-	}, nil
+	}
+	tr.OriginalName = tr.Name
+
+	// check to see  if there is an override name
+	sa, err := t.readServiceAccount(tr.Namespace, tr.Name, tr.UID)
+	if err != nil {
+		return nil, err
+	}
+
+	annotations := sa.GetObjectMeta().GetAnnotations()
+
+	if serviceNameOverride, ok := annotations[serviceAccountServiceNameAnnotation]; ok {
+		tr.Name = serviceNameOverride
+	}
+
+	return tr, nil
 }
 
 func jsonDebug(v interface{}) string {
@@ -315,18 +409,28 @@ func jsonDebug(v interface{}) string {
 	return string(b)
 }
 
-// parseResponse takes the API response and either returns the appropriate error
+// parseTokenReviewResponse takes the API response and either returns the appropriate error
 // or the TokenReview Object.
 func parseTokenReviewResponse(resp *http.Response) (*authv1.TokenReview, error) {
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	// If the request was not a success create a kubernetes error
 	if resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent {
-		return nil, kubeerrors.NewGenericServerResponse(resp.StatusCode, "POST", schema.GroupResource{}, "", strings.TrimSpace(string(body)), 0, true)
+		return nil, kubeerrors.NewGenericServerResponse(
+			resp.StatusCode,                 // code int
+			"POST",                          // verb string
+			schema.GroupResource{},          // qualifiedResource schema.GroupResource
+			"",                              // name string
+			strings.TrimSpace(string(body)), // serverMessage string
+			0,                               // retryAfterSeconds int
+			true,                            // isUnexpectedResponse bool
+		)
 	}
 
 	// If we can successfully Unmarshal into a status object that means there is
